@@ -12,6 +12,8 @@ You can use the notebook Run.ipynb or the script Run.py.
 # How to change the obstacle shape ?
 obstacle shape are read from a text file. See Circle.txt for example.
 
+
+# Some videos
 [![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/Ph7dVfcWveQ/0.jpg)](https://www.youtube.com/watch?v=Ph7dVfcWveQ)
 
 [![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/w-3g8Jeuhn4/0.jpg)](https://www.youtube.com/watch?v=w-3g8Jeuhn4)
