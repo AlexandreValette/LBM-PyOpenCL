@@ -1,6 +1,7 @@
 # LBM-PyOpenCL
 
-Lattice Boltzmann Method with Multiple Relaxation Time (LBM-MRT), D2Q9 
+Lattice Boltzmann Method with Multiple Relaxation Time (LBM-MRT), D2Q9
+
 Code : 
   - Host : PYTHON 
   - Computation : OPENCL on GPU (or CPU)
