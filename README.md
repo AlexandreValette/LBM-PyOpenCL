@@ -1,6 +1,7 @@
 # LBM-PyOpenCL
 
 Lattice Boltzmann Method with Multiple Relaxation Time (LBM-MRT), D2Q9.
+
 Run on OpenCL compatible GPU.
 Tested on NVIDIA GTX970.
 
@@ -13,7 +14,7 @@ Code :
 You can use the notebook Run.ipynb or the script Run.py.
 
 # How to change the obstacle shape ?
-Obstacle shape are read from a text file. See Circle.txt for example.
+The obstacle shape is read from a text file. See Circle.txt for example.
 
 # Third parties libraries
 You need :
