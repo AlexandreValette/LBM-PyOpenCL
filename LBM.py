@@ -1,23 +1,7 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import, print_function
-import sys
-import numpy as np; from numpy.linalg import *
-import matplotlib.pyplot as plt; from matplotlib import cm
-import cProfile
-import pstats
-import time
-import itertools
-import pygame
-import Obstacle_manager as Obstacle_manager
-# OpenCL imports
-from pyopencl.tools import get_gl_sharing_context_properties
+import numpy as np
 import pyopencl as cl
 import ctypes as ct
-import matplotlib.path as mplPath
-# OpenGL imports
-from OpenGL.GL import *
-from OpenGL.GLUT import *
-from OpenGL.raw.GL.VERSION.GL_1_5 import glBufferData as rawGlBufferData
 
 class RectDye:
     def __init__(self,  cx_min,cx_max, cy_min, cy_max, value, life_dt, randomize = False):

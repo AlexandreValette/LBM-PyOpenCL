@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import pygame
-from pygame.locals import *
 import LBM
 import numpy as np
 import pyopencl as cl
