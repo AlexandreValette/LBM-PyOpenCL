@@ -16,7 +16,7 @@ You can use the notebook Run.ipynb or the script Run.py.
 # How to change the obstacle shape ?
 The obstacle shape is read from a text file. See Circle.txt for example.
 
-# Third parties libraries
+# Third party libraries
 You need :
   - numpy ;
   - matplotlib ;
