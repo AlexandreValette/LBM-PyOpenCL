@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     "obstacle_file": "FlatPlane.txt",   # file of world_objects/, "" for none
     "obstacle_x": 0.25, "obstacle_y": 0.5,   # position, as a fraction of the grid
     "obstacle_rotation": 45.0, "obstacle_scale": 0.14,
-    "dye": True, "dye_y": 0.5, "dye_freq": 10,   # dye : OpenCL solver only
+    "dye": True, "dye_y": 0.5, "dye_freq": 10,   # passive dye : emitter at the inlet, refreshed every dye_freq frames
     "jpeg_quality": 85,
 }
 
@@ -160,13 +160,24 @@ class OpenCLBackend:
 
 
 class NativeBackend:
-    """lbm_native.py : the same model in plain NumPy, on the CPU. No dye."""
+    """lbm_native.py : the same model in plain NumPy, on the CPU. Subclasses change the model (_make_model)."""
     def __init__(self, c):
-        import lbm_native
         self.c = c
-        self.device_text = "CPU : Python natif (NumPy)"
-        self.lbm = lbm_native.LBMNative(float(c["re"]), c["ny"] / 2, c["nx"], c["ny"],
-                                        speedup=float(c["speedup"]))
+        self.lbm = self._make_model()
+        self.device_text = self._device_text()
+        self._dye_rect, self._counter, self._emit_dye = None, 0, 0
+        if c["dye"]:
+            self.lbm.enable_dye()
+            cy = int(float(c["dye_y"]) * c["ny"])
+            self._dye_rect = (1, 2, max(cy - 1, 1), min(cy + 2, c["ny"] - 1), 1., 100)
+
+    def _make_model(self):
+        import lbm_native
+        c = self.c
+        return lbm_native.LBMNative(float(c["re"]), c["ny"] / 2, c["nx"], c["ny"], speedup=float(c["speedup"]))
+
+    def _device_text(self):
+        return "CPU : Python natif (NumPy)"
 
     def set_obstacle(self, obstacle):
         self.lbm.set_obstacle(obstacle)
@@ -176,27 +187,34 @@ class NativeBackend:
             self.lbm.update_re(float(self.c["re"]))
 
     def step(self, iters):
+        if self._dye_rect and self._counter == self._emit_dye:      # same schedule as OpenCLBackend
+            self.lbm.add_dye_rect(*self._dye_rect)
+            self._emit_dye += max(1, int(self.c["dye_freq"]))
         self.lbm.run(iters)
+        self._counter += 1
 
     def render(self):
         c = self.c
         u, v, _ = self.lbm.get_fields()
+        dye = self.lbm.get_dye() if self.lbm.dye is not None else None
         k = float(c["speedup"])          # same scaling as LBM_OCL.set_texture_min_max
         if c["display"] == "curl":
-            return tools.render_field(u, v, self.lbm.obstacle, "curl", vmax=float(c["curl_max"]) * k)
+            return tools.render_field(u, v, self.lbm.obstacle, "curl", vmax=float(c["curl_max"]) * k, dye=dye)
         return tools.render_field(u, v, self.lbm.obstacle, "norm",
-                                  vmin=float(c["t_min"]) * k, vmax=float(c["t_max"]) * k)
+                                  vmin=float(c["t_min"]) * k, vmax=float(c["t_max"]) * k, dye=dye)
 
 
 class NumbaBackend(NativeBackend):
-    """lbm_numba.py : same model, compiled and multithreaded with Numba. No dye."""
-    def __init__(self, c):
+    """lbm_numba.py : same model, compiled and multithreaded with Numba."""
+    def _make_model(self):
         import lbm_numba
-        self.c = c
+        c = self.c
         lbm_numba.warm_up()
-        self.lbm = lbm_numba.LBMNumba(float(c["re"]), c["ny"] / 2, c["nx"], c["ny"],
-                                      speedup=float(c["speedup"]), threads=int(c["threads"]))
-        self.device_text = "CPU : Python Numba sur %d threads" % self.lbm.threads
+        return lbm_numba.LBMNumba(float(c["re"]), c["ny"] / 2, c["nx"], c["ny"],
+                                  speedup=float(c["speedup"]), threads=int(c["threads"]))
+
+    def _device_text(self):
+        return "CPU : Python Numba sur %d threads" % self.lbm.threads
 
 
 BACKENDS = {"opencl": OpenCLBackend, "native": NativeBackend, "numba": NumbaBackend}

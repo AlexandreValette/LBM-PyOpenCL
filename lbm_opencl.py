@@ -337,6 +337,12 @@ class LBM_OCL:
         cl.enqueue_copy(self.ocl_d.queue, self.lbm.uvrho, self.ocl_uvrho).wait() 
         return np.copy(self.lbm.uvrho.reshape(self.shape2D_f4 ))
     
+    def get_dye(self):
+        """Read back the dye field : float32 array (nx, ny), the copy written by the latest advection."""
+        host = np.zeros((self.shape2D[0], self.shape2D[1], 2), dtype=np.float32)
+        cl.enqueue_copy(self.ocl_d.queue, host, self.ocl_dye).wait()
+        return np.copy(host[:, :, int(self.read_dye_channel)])
+
     def get_fout(self):
         """Read back the post-collision populations : (f0 (nx, ny), f14 (nx, ny, 4), f58 (nx, ny, 4))."""
         cl.enqueue_copy(self.ocl_d.queue, self.lbm.fout0, self.ocl_fout0).wait() 

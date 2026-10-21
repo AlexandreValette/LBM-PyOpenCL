@@ -6,7 +6,9 @@
   - lbm_native (NumPy) is the readable reference ;
   - lbm_numba must match it ;
   - lbm_opencl (GPU / OpenCL CPU) must match it too (skipped when no OpenCL device works).
-All of them use float32, so fields agree to about 1e-6, not to the last bit.
+All of them use float32, so fields agree to about 1e-6, not to the last bit. The dye is more sensitive (it
+follows sharp fronts, and over hundreds of steps tiny float differences grow) : it is compared over a single
+advection step on a random field (strict), and over a few dozen steps of a real simulation (looser).
 """
 import os
 import sys
@@ -19,12 +21,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lbm_native
 import lbm_numba
+import lbm_opencl
 import ocl_driver
 import simulation_session as ss
 
 NX, NY, RE = 128, 64, 1e3
 TOLERANCE = 5e-6          # max absolute difference on u, v, rho (all about 0.04 and 1)
 STEPS = (1, 10, 100, 300)
+DYE_STEPS = (1, 10, 30)
+DYE_TOLERANCE = 1e-4      # dye values are between 0 and about 1.3
+DYE_EMITTER = (1, 2, 31, 34, 1., 1000)     # cells x in [1, 2[, y in [31, 34[ , value 1, life 1000 steps
 
 
 def setUpModule():
@@ -97,6 +103,54 @@ class NumbaMatchesNumpy(unittest.TestCase):
         self.assertLess(max(diffs), TOLERANCE, diffs)
 
 
+def smooth_flow_and_random_dye():
+    """A velocity field with some structure, and a random dye field (sharp, a hard case for the interpolation)."""
+    xx, yy = np.meshgrid(np.arange(NX), np.arange(NY), indexing="ij")
+    u = (0.04 + 0.03 * np.sin(xx / 9.) * np.cos(yy / 7.)).astype(np.float32)
+    v = (0.03 * np.cos(xx / 11.) * np.sin(yy / 5.)).astype(np.float32)
+    dye = np.random.default_rng(1).random((NX, NY)).astype(np.float32)
+    return u, v, dye
+
+
+class DyeNumbaMatchesNumpy(unittest.TestCase):
+    def test_one_advection_step_on_random_dye(self):
+        obstacle = make_obstacle()
+        u, v, dye = smooth_flow_and_random_dye()
+        reference = lbm_native.LBMNative(RE, NY / 2, NX, NY)
+        reference.set_obstacle(obstacle)
+        reference.u[:], reference.v[:] = u, v
+        reference.enable_dye()
+        reference.dye[0] = dye
+        reference._advect_dye()
+        src, dst = np.stack([dye, np.zeros_like(dye)]), np.zeros((NX, NY), dtype=np.float32)
+        lbm_numba._dye_advect(src[0], dst, u, v, obstacle, NX, NY)
+        diff = np.abs(reference.get_dye() - dst)[~obstacle].max()
+        self.assertLess(diff, 1e-5)
+
+    def test_simulation_with_dye(self):
+        obstacle = make_obstacle()
+        reference = lbm_native.LBMNative(RE, NY / 2, NX, NY)
+        compiled = lbm_numba.LBMNumba(RE, NY / 2, NX, NY)
+        for model in (reference, compiled):
+            model.set_obstacle(obstacle)
+            model.enable_dye()
+            model.add_dye_rect(*DYE_EMITTER)
+        done = 0
+        for target in DYE_STEPS:
+            reference.run(target - done)
+            compiled.run(target - done)
+            done = target
+            diff = np.abs(reference.get_dye() - compiled.get_dye())[~obstacle].max()
+            self.assertLess(diff, DYE_TOLERANCE, "step %d" % target)
+        self.assertGreater(reference.get_dye().max(), 0.5)       # the dye really spreads from the emitter
+
+    def test_dye_stays_zero_without_emitter(self):
+        model = lbm_native.LBMNative(RE, NY / 2, NX, NY)
+        model.enable_dye()
+        model.run(20)
+        self.assertEqual(float(np.abs(model.get_dye()).max()), 0.)
+
+
 def opencl_available():
     try:
         return len(ocl_driver.list_devices()) > 0
@@ -125,6 +179,59 @@ class OpenCLMatchesNumpy(unittest.TestCase):
                     opencl_fields = (uvrho[:, :, 0], uvrho[:, :, 1], uvrho[:, :, 2])
                     diffs = max_differences(reference.get_fields(), opencl_fields, ~obstacle)
                     self.assertLess(max(diffs), TOLERANCE, "step %d : %s" % (target, diffs))
+
+
+@unittest.skipUnless(opencl_available(), "no working OpenCL device")
+class DyeOpenCLMatchesNumpy(unittest.TestCase):
+    def test_every_opencl_device_matches(self):
+        obstacle = make_obstacle()
+        u, v, dye = smooth_flow_and_random_dye()
+        reference = lbm_native.LBMNative(RE, NY / 2, NX, NY)
+        reference.set_obstacle(obstacle)
+        reference.u[:], reference.v[:] = u, v
+        reference.enable_dye()
+        reference.dye[0] = dye
+        reference._advect_dye()
+        for device in ocl_driver.list_devices():
+            with self.subTest(device="%s : %s" % (device["type"], device["name"])):
+                import pyopencl as cl
+                config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, device=device["id"])
+                backend = ss.OpenCLBackend(config)
+                solver = backend.lbm_ocl
+                solver.update_obstacle(obstacle)
+                uvrho = np.zeros((NX, NY, 4), dtype=np.float32)
+                uvrho[:, :, 0], uvrho[:, :, 1], uvrho[:, :, 2] = u, v, 1.
+                cl.enqueue_copy(solver.ocl_d.queue, solver.ocl_uvrho, uvrho)
+                solver.enable_dye(np.stack([dye, np.zeros_like(dye)], axis=-1).copy())
+                solver.dye()                                     # one advection step
+                backend.queue.finish()
+                diff = np.abs(reference.get_dye() - solver.get_dye())[~obstacle].max()
+                self.assertLess(diff, 1e-5)
+
+    def test_simulation_with_dye_matches_for_a_few_steps(self):
+        obstacle = make_obstacle()
+        for device in ocl_driver.list_devices():
+            with self.subTest(device="%s : %s" % (device["type"], device["name"])):
+                config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, device=device["id"])
+                backend = ss.OpenCLBackend(config)
+                backend.set_obstacle(obstacle)
+                solver = backend.lbm_ocl
+                solver.enable_dye(np.zeros((NX, NY, 2), dtype=np.float32))
+                emitters = lbm_opencl.DyeEmitter(solver.shape2D)
+                emitters.add_rect_emitter(lbm_opencl.RectDye(*DYE_EMITTER))
+                solver.add_dye_emitters(emitters)
+                reference = lbm_native.LBMNative(RE, NY / 2, NX, NY)
+                reference.set_obstacle(obstacle)
+                reference.enable_dye()
+                reference.add_dye_rect(*DYE_EMITTER)
+                done = 0
+                for target in DYE_STEPS:
+                    reference.run(target - done)
+                    solver.run(target - done)
+                    backend.queue.finish()
+                    done = target
+                    diff = np.abs(reference.get_dye() - solver.get_dye())[~obstacle].max()
+                    self.assertLess(diff, DYE_TOLERANCE, "step %d" % target)
 
 
 if __name__ == "__main__":

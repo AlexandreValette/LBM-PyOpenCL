@@ -15,9 +15,9 @@ On simule un fluide qui s'écoule de gauche à droite dans une boîte 2D, autour
 
 | Solveur | Fichier | Tourne sur | Colorant | Vitesse (512×256, Ryzen 9 5900X / RTX 4080) |
 |---|---|---|---|---|
-| **OpenCL** | `lbm_opencl.py` + `kernels.cl` | GPU, ou CPU via un runtime OpenCL | oui | ~97 MLUPS (GPU) |
-| **Python NumPy** | `lbm_native.py` | CPU (1 cœur + BLAS) | non | ~17 MLUPS |
-| **Python Numba** | `lbm_numba.py` | CPU, tous les threads | non | ~178 MLUPS |
+| **OpenCL** | `lbm_opencl.py` + `kernels.cl` | GPU, ou CPU via un runtime OpenCL | oui | ~97 MLUPS (GPU, colorant et rendu compris) |
+| **Python NumPy** | `lbm_native.py` | CPU (1 cœur + BLAS) | oui | ~17 MLUPS (~1,3 avec colorant) |
+| **Python Numba** | `lbm_numba.py` | CPU, tous les threads | oui | ~160 MLUPS (~70 avec colorant) |
 
 *MLUPS = millions de cellules mises à jour par seconde.* Le solveur NumPy sert de **référence lisible** : les deux autres sont vérifiés contre lui par les tests (section 7).
 
@@ -66,6 +66,7 @@ Le panneau du haut règle la simulation, l'image s'affiche en dessous, la barre 
 - **En direct** : Reynolds, pas par image, affichage (norme / rotationnel), échelles de couleur, obstacle (profil, position, rotation, taille).
 - **Au démarrage** (re-cliquer sur « Démarrer ») : solveur, device, threads CPU, grille, speedup, colorant.
 - Molette = zoom, glisser = déplacer, double-clic = recentrer.
+- **Réinitialiser** remet tous les réglages et la vue à leurs valeurs par défaut (celles de `DEFAULT_CONFIG`, lues via `/api/config`) ; si une simulation tourne, elle est relancée de zéro avec ces valeurs.
 
 ---
 
@@ -135,7 +136,7 @@ La MRT est plus stable que la BGK à grand Reynolds. `M1S = M⁻¹·S` est calcu
 | Obstacle | **bounce-back** : les populations rebondissent (direction opposée) |
 
 ### Colorant
-Un scalaire passif transporté par la vitesse (advection semi-lagrangienne : on remonte la trajectoire, on interpole le colorant à cet endroit). Il sert uniquement à visualiser ; il n'agit pas sur le fluide. Seul le solveur OpenCL le calcule.
+Un scalaire passif transporté par la vitesse (advection semi-lagrangienne : on remonte la trajectoire, on interpole le colorant à cet endroit). Il sert uniquement à visualiser ; il n'agit pas sur le fluide. Les trois solveurs le calculent avec le même algorithme : à chaque pas, pour chaque cellule fluide, trajectoire rétrograde par Runge-Kutta à trois étages (`k1 = -u`, point à ½·k1, puis à ¾·k2, puis combinaison 2/9·k1 + 1/3·k2 + 4/9·k3) et interpolation bicubique de Lagrange 4×4 du colorant à l'arrivée (0 si un point sort de la grille) ; puis les émetteurs réécrivent leur valeur dans les cellules où ils sont actifs. Le colorant est affiché dans le canal alpha : `alpha = 1 − colorant`, qui fond la couleur vers le fond sombre.
 
 ---
 
@@ -154,7 +155,7 @@ FastAPI. `GET /` sert la page ; `GET /api/devices` liste les devices OpenCL ; `G
 HTML/CSS/JS sans bibliothèque. Un formulaire (`readConfig` lit les champs, `sendLive` envoie les changements en direct avec un petit délai anti-rebond), un `<canvas>` où l'on dessine chaque JPEG reçu, le zoom/déplacement à la souris, la barre d'état. `onSolverChange` grise les champs inutiles selon le solveur.
 
 ### `lbm_native.py` — le modèle de référence
-Classe `LBMNative` (tout en NumPy, `float32`). `run(n)` répète : `_bcs` → `_inlet` → `_collision` → `_streaming`. `get_fields()` renvoie `(u, v, rho)`. Les formules de la collision sont celles du kernel `moments` (équilibre des moments avec `j/ρ ≈ j`, approximation faible compressibilité). Pas de colorant.
+Classe `LBMNative` (tout en NumPy, `float32`). `run(n)` répète : `_bcs` → `_inlet` → `_collision` → `_streaming`. `get_fields()` renvoie `(u, v, rho)`. Les formules de la collision sont celles du kernel `moments` (équilibre des moments avec `j/ρ ≈ j`, approximation faible compressibilité). Le colorant s'active avec `enable_dye()`, s'alimente avec `add_dye_rect(...)` (même sémantique que `RectDye`), se lit avec `get_dye()` ; l'advection est `_advect_dye` (interpolation par `take` sur indices plats).
 
 ### `lbm_numba.py` — le modèle compilé
 `LBMNumba` hérite de `LBMNative` (mêmes paramètres, même interface) et remplace le calcul par des fonctions `@njit` : `_collision` et `_streaming` sont parallélisées sur `x` avec `prange`. `warm_up()` compile (ou charge du cache `__pycache__`) avant la première vraie simulation. Le nombre de threads est global au processus (`numba.set_num_threads`).
@@ -217,7 +218,8 @@ Pour porter le moteur lui-même dans Unity, les kernels de `kernels.cl` sont du 
 `tests/test_models.py` vérifie, sur une grille 128×64 (Re = 1000, plaque inclinée), après 1, 10, 100 et 300 pas :
 - l'écoulement uniforme sans obstacle reste uniforme ; un obstacle crée bien un sillage ;
 - **Numba = NumPy** (écart maximal sur `u, v, ρ` < 5e-6) ; idem après un changement de Reynolds en cours de route ;
-- **OpenCL = NumPy** sur **chaque** device OpenCL utilisable (GPU et CPU) ; ignoré si aucun device ne fonctionne.
+- **OpenCL = NumPy** sur **chaque** device OpenCL utilisable (GPU et CPU) ; ignoré si aucun device ne fonctionne ;
+- **colorant** : une étape d'advection sur un colorant aléatoire (NumPy, Numba et OpenCL concordent à 1e-5), et une simulation avec émetteur sur 1, 10 et 30 pas (écart < 1e-4) ; le colorant reste nul sans émetteur.
 
 ---
 
@@ -228,4 +230,4 @@ Pour porter le moteur lui-même dans Unity, les kernels de `kernels.cl` sont du 
 - **L'interface se fige au démarrage avec le CPU Intel** : le runtime Intel a bloqué de façon intermittente à la création du contexte OpenCL (observé seulement pendant les premiers tests). Relancer `app.py`.
 - **Partage OpenCL/OpenGL** : non utilisé (la roue pip de PyOpenCL est compilée sans). L'image est relue côté CPU. Les restes d'interop dans `lbm_opencl.py` (`add_postrun_texture_interop`, `acquire/release_gl_objects`) ne servent plus qu'à ce chemin.
 - **Instabilité** : à Reynolds élevé et vitesse forte, la simulation peut diverger (image uniforme, NaN). Réduire `speedup` ou le Reynolds. La sortie à gradient nul peut produire des réflexions.
-- **Colorant** : seul le solveur OpenCL le calcule.
+- **Colorant** : sensible. Il suit des fronts raides (jusqu'à 1 d'écart entre deux cellules voisines) et l'interpolation bicubique dépasse un peu 1 ; sur plusieurs centaines de pas, les petites différences de float32 entre solveurs s'amplifient près de l'émetteur (jusqu'à ~4e-2 après 300 pas entre OpenCL et NumPy, alors que les vitesses concordent à 1e-6). Les tests comparent donc le colorant sur un pas (strict) et sur quelques dizaines de pas (plus lâche). Il est ~8 fois plus lent avec colorant en NumPy (100 ms par pas en 512×256).

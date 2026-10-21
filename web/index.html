@@ -91,6 +91,7 @@
     <div class="actions" style="margin-top:12px">
       <button class="primary" id="start">Démarrer</button>
       <button id="stop">Arrêter</button>
+      <button id="reset" title="Remet tous les réglages par défaut ; si la simulation tourne, elle repart de zéro">Réinitialiser</button>
       <span id="error"></span>
     </div>
   </section>
@@ -140,10 +141,10 @@ function sendLive(id) {
   clearTimeout(sendLive.t);
   sendLive.t = setTimeout(() => ws.send(JSON.stringify({type: "set", params})), 40);
 }
-// The Python solvers run on the CPU, without dye : grey out the OpenCL-only options (threads : Numba only)
+// The Python solvers run on the CPU : grey out the device list ; the thread count only applies to Numba
 function onSolverChange() {
   const solver = $("solver").value, native = solver !== "opencl";
-  const off = {device: native, dye: native, dye_y: native, threads: solver !== "numba"};
+  const off = {device: native, threads: solver !== "numba"};
   Object.keys(off).forEach(id => {
     $(id).disabled = off[id];
     $(id).closest("label").classList.toggle("off", off[id]);
@@ -188,6 +189,15 @@ $("start").onclick = () => {
   running = true;
   ws.send(JSON.stringify({type: "start", config: readConfig()}));
 };
+// Reset : default settings, default view ; a running simulation is restarted from scratch with them
+$("reset").onclick = () => {
+  applyDefaults();
+  zoom = 1; panX = panY = 0; applyView();
+  if (running && ws && ws.readyState === 1) {
+    $("error").textContent = "";
+    ws.send(JSON.stringify({type: "start", config: readConfig()}));
+  }
+};
 $("stop").onclick = () => { if (ws && ws.readyState === 1) { running = false; ws.send('{"type":"stop"}'); } };
 
 // ---------- view : zoom / pan
@@ -221,6 +231,11 @@ async function init() {
     `<option value="${d.id}">${d.type} · ${d.name} (${d.compute_units} CU)</option>`).join("");
   $("obstacle_file").innerHTML = '<option value="">(aucun)</option>' +
     conf.obstacles.map(f => `<option>${f}</option>`).join("");
+  applyDefaults();
+  connect();
+}
+// Put every field back to its default value (defaults come from the server, see /api/config)
+function applyDefaults() {
   const d = defaults;
   $("solver").value = d.solver; $("threads").value = d.threads; $("device").value = d.device; $("nx").value = d.nx; $("ny").value = d.ny; $("speedup").value = d.speedup;
   $("dye").checked = d.dye; $("dye_y").value = d.dye_y; $("re_log").value = Math.log10(d.re);
@@ -228,7 +243,7 @@ async function init() {
   $("t_max").value = d.t_max; $("curl_max").value = d.curl_max;
   $("obstacle_file").value = d.obstacle_file; $("obstacle_x").value = d.obstacle_x; $("obstacle_y").value = d.obstacle_y;
   $("obstacle_rotation").value = d.obstacle_rotation; $("obstacle_scale").value = d.obstacle_scale;
-  onSolverChange(); showValues(); fitView(); connect();
+  onSolverChange(); showValues(); fitView();
 }
 init();
 </script>

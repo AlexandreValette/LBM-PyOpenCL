@@ -2,7 +2,7 @@
 """LBM D2Q9 / MRT in Python, compiled and multithreaded with Numba.
 
 Same model and conventions as lbm_native.py (NumPy) and lbm_opencl.py : only the way of computing differs.
-Collision and streaming are explicit loops over the cells, parallelized over x with prange.
+Collision, streaming and dye advection are explicit loops over the cells, parallelized over x with prange.
 """
 import numpy as np
 import numba
@@ -101,16 +101,88 @@ def _streaming(fout, fin, nx, ny):
 
 
 @njit(cache=True)
-def _run(nb_iter, fin, fout, u, v, rhof, obstacle, m1s, nx, ny, u_lb):
+def _lagrange(s):
+    """Weights of the 4 samples (offsets -1, 0, 1, 2) for a position s in [0, 1[ inside the central cell."""
+    s2 = s * s
+    s3 = s2 * s
+    return (-s / 3. + 0.5 * s2 - s3 / 6.,
+            1. - s2 + 0.5 * (s3 - s),
+            s + 0.5 * (s2 - s3),
+            (s3 - s) / 6.)
+
+
+@njit(cache=True)
+def _interp(f, px, py):
+    """Bicubic (4 x 4 Lagrange) interpolation of the 2D array f at (px, py), which must be inside the grid."""
+    ix = int(px)
+    iy = int(py)
+    wx = _lagrange(px - ix)
+    wy = _lagrange(py - iy)
+    total = 0.
+    for a in range(4):
+        for b in range(4):
+            total += wx[a] * wy[b] * f[ix + a - 1, iy + b - 1]
+    return total
+
+
+@njit(parallel=True, cache=True)
+def _dye_advect(src, dst, u, v, obstacle, nx, ny):
+    """Semi-Lagrangian advection (kernel dye_bipolyinter) : 3-stage Runge-Kutta backwards along the velocity,
+    then bicubic interpolation of the dye. A trajectory point outside the interior of the grid gives 0."""
+    for x in prange(nx):
+        for y in range(ny):
+            if obstacle[x, y]:
+                continue
+            qn = 0.
+            k1x = -u[x, y]
+            k1y = -v[x, y]
+            px = x + 0.5 * k1x
+            py = y + 0.5 * k1y
+            if px >= 1 and px < nx - 2 and py >= 1 and py < ny - 2:
+                k2x = -_interp(u, px, py)
+                k2y = -_interp(v, px, py)
+                px = x + 0.75 * k2x
+                py = y + 0.75 * k2y
+                if px >= 1 and px < nx - 2 and py >= 1 and py < ny - 2:
+                    k3x = -_interp(u, px, py)
+                    k3y = -_interp(v, px, py)
+                    px = x + (2. / 9.) * k1x + (1. / 3.) * k2x + (4. / 9.) * k3x
+                    py = y + (2. / 9.) * k1y + (1. / 3.) * k2y + (4. / 9.) * k3y
+                    if px >= 1 and px < nx - 2 and py >= 1 and py < ny - 2:
+                        qn = _interp(src, px, py)
+            dst[x, y] = qn
+
+
+@njit(cache=True)
+def _emit(dye, emitters):
+    """Write the dye of the active emitters (rows : ix, iy, value, life), then decrement their life."""
+    for e in range(emitters.shape[0]):
+        if emitters[e, 3] > 0:
+            ix = int(emitters[e, 0])
+            iy = int(emitters[e, 1])
+            dye[0, ix, iy] = emitters[e, 2]
+            dye[1, ix, iy] = emitters[e, 2]
+            emitters[e, 3] -= 1
+
+
+@njit(cache=True)
+def _run(nb_iter, fin, fout, u, v, rhof, obstacle, m1s, nx, ny, u_lb, use_dye, dye, dye_read, emitters):
+    """nb_iter time steps. Returns the index of the dye copy that holds the latest dye field."""
     for _ in range(nb_iter):
         _bcs(fin, nx, ny)
         _inlet(fin, ny, u_lb)
         _collision(fin, fout, u, v, rhof, obstacle, m1s, nx, ny)
         _streaming(fout, fin, nx, ny)
+        if use_dye:
+            _dye_advect(dye[dye_read], dye[1 - dye_read], u, v, obstacle, nx, ny)
+            dye_read = 1 - dye_read
+            _emit(dye, emitters)
+    return dye_read
 
 
 class LBMNumba(LBMNative):
-    """Same interface as LBMNative : run(n), get_fields(), set_obstacle(mask), update_re(re)."""
+    """Same interface as LBMNative : run(n), get_fields(), set_obstacle(mask), update_re(re), and the dye
+    (enable_dye, add_dye_rect, get_dye, inherited)."""
     def __init__(self, re, l_ref, nx, ny, speedup=1., threads=0):
         """threads : number of Numba threads (0 = all the cores). The setting is global to the process."""
         super().__init__(re, l_ref, nx, ny, speedup=speedup, dtype=np.float32)
@@ -119,11 +191,19 @@ class LBMNumba(LBMNative):
         self.fout = np.zeros_like(self.fin)
 
     def run(self, nb_iter):
-        _run(int(nb_iter), self.fin, self.fout, self.u, self.v, self.rho, self.obstacle,
-             np.ascontiguousarray(self.M1S), self.nx, self.ny, float(self.uLB))
+        use_dye = self.dye is not None
+        dye = self.dye if use_dye else np.zeros((2, 1, 1), dtype=np.float32)
+        self._dye_read = _run(int(nb_iter), self.fin, self.fout, self.u, self.v, self.rho, self.obstacle,
+                              np.ascontiguousarray(self.M1S), self.nx, self.ny, float(self.uLB),
+                              use_dye, dye, self._dye_read, self._emitters)
         self.iteration += int(nb_iter)
 
 
 def warm_up():
     """Compile (or load from the cache) the kernels, so the first real step is not slow."""
-    LBMNumba(1e3, 4, 8, 8).run(1)
+    for dye in (False, True):
+        model = LBMNumba(1e3, 4, 8, 8)
+        if dye:
+            model.enable_dye()
+            model.add_dye_rect(1, 2, 2, 4, 1., 5)
+        model.run(1)
