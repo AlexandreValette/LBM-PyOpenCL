@@ -63,7 +63,7 @@ python -m venv .venv
 
 ### Utiliser l'interface
 Le panneau du haut règle la simulation, l'image s'affiche en dessous, la barre d'état donne l'état, les **FPS**, les **MLUPS**, le **solveur** (`GPU : <nom>`, `CPU : <nom> sur N threads`…), la grille et l'itération.
-- **En direct** : Reynolds, pas par image, affichage (norme / rotationnel), échelles de couleur, obstacle (profil, position, rotation, taille).
+- **En direct** : Reynolds, pas par image, affichage (norme / rotationnel), échelles de couleur, position verticale, cadence et couleur du colorant, méthodes numériques (collision, entrée, sortie), obstacle (profil, position, rotation, taille).
 - **Au démarrage** (re-cliquer sur « Démarrer ») : solveur, device, threads CPU, grille, speedup, colorant.
 - Molette = zoom, glisser = déplacer, double-clic = recentrer.
 - **Réinitialiser** remet tous les réglages et la vue à leurs valeurs par défaut (celles de `DEFAULT_CONFIG`, lues via `/api/config`) ; si une simulation tourne, elle est relancée de zéro avec ces valeurs.
@@ -134,6 +134,35 @@ La MRT est plus stable que la BGK à grand Reynolds. `M1S = M⁻¹·S` est calcu
 | Sortie (`x = nx−1`) | gradient nul : copie de la colonne voisine |
 | Haut et bas | périodiques : les populations manquantes viennent du bord opposé |
 | Obstacle | **bounce-back** : les populations rebondissent (direction opposée) |
+
+### Méthodes numériques au choix
+Les méthodes d'origine (MRT, entrée équilibre, sortie gradient nul) restent disponibles ; la collision par défaut est maintenant **Smagorinsky** (voir le critère de stabilité plus bas). Trois alternatives sont ajoutées, choisies en direct dans l'IHM (bloc « Méthodes numériques ») et identiques dans les trois solveurs (`set_methods(collision, inlet, outlet, smagorinsky)`) :
+
+| Choix | Méthode d'origine | Alternative | Principe (référence) |
+|---|---|---|---|
+| Collision | `mrt` | `regularized` | BGK où la partie hors équilibre est projetée sur le tenseur des contraintes ; supprime les modes « fantômes » (Latt & Chopard, 2006). Noyau `moments_reg`. |
+| | | `smagorinsky` | régularisée + temps de relaxation local `τ = ½(τ₀ + √(τ₀² + 18√2·Cs²·‖Π‖/ρ))` : une viscosité turbulente qui croît avec le cisaillement (Hou et al., 1996). `Cs` ≈ 0,1. |
+| Entrée | `equilibrium` | `zouhe` | populations 1, 5, 8 par rebond de la partie hors équilibre : bonne quantité de mouvement et bon cisaillement à l'entrée (Zou & He, 1997). Noyau `bcs_inlet_zouhe`. |
+| Sortie | `zero_gradient` | `convective` | les populations entrantes (3, 6, 7) sont advectées à la vitesse `uLB` : `f(t+1) = (f(t) + uc·f_voisin(t+1)) / (1 + uc)`, avec mémoire du pas précédent. Noyau `bcs_outlet_convective`. |
+
+Les indicateurs de stabilité sont dans la barre d'état : **τ = 1/ω** (proche de 0,5 = peu visqueux, donc fragile), **Mach max** (le modèle n'est valable que pour Ma ≲ 0,3), **ρ moyen** (doit rester ≈ 1). Si les champs deviennent non finis, la simulation s'arrête avec le message « la simulation a divergé ».
+
+Essai sur 512×256 avec la plaque inclinée (Numba, 30 000 pas) :
+
+| Collision | Re = 1e4 | Re = 1e5 | Re = 1e7 |
+|---|---|---|---|
+| MRT | stable, mais Mach max 0,46 | diverge vers le pas 12 500 | diverge vers le pas 10 000 |
+| Smagorinsky | stable, Mach max 0,29 | stable, Mach max 0,26 | stable, Mach max 0,23 |
+
+La collision *régularisée seule* diverge dès Re = 1e5 (comme la MRT, plus vite). Zou-He et la sortie convective ne changent pas la stabilité sur ce cas. Sur 5000 pas la MRT semblait stable partout : il faut des essais longs.
+
+**Critère de stabilité sur le Reynolds.** Il n'y a pas de seuil exact, mais :
+- condition nécessaire : `τ > 0,5`, c'est-à-dire `ν = uLB·l_ref/Re > 0` (toujours vrai ici) ;
+- condition pratique sans modèle de turbulence : la viscosité réseau ne doit pas être trop petite, ou de façon équivalente le **Reynolds de maille** `Re_maille = uLB/ν = Re/l_ref` ne doit pas être trop grand. Avec `l_ref = ny/2 = 128` : stable à Re = 1e4 (`ν ≈ 5e-4`, `Re_maille ≈ 80`), instable à 1e5 (`ν ≈ 5e-5`, `Re_maille ≈ 800`). Le seuil de la MRT se situe donc entre les deux, vers `Re_maille ≈ 100–300`, soit **`Re_max ≈ (100 à 300) × l_ref`** : il croît avec la résolution (doubler `ny` double le Reynolds accessible) ;
+- au-delà, il faut résoudre la turbulence (grille plus fine) ou la modéliser (Smagorinsky), qui ajoute de la viscosité là où le cisaillement est fort ;
+- en parallèle, `Mach = uLB·√3 < ~0,3` (`uLB = 0,04 × speedup`) et la densité doit rester proche de 1.
+
+Ces ordres de grandeur viennent de nos essais sur ce seul cas ; d'autres obstacles ou angles peuvent changer le seuil. Non implémentés (pistes de la littérature) : zone éponge en sortie, bounce-back interpolé de Bouzidi pour les profils courbes, collisions entropique ou à moments centraux.
 
 ### Colorant
 Un scalaire passif transporté par la vitesse (advection semi-lagrangienne : on remonte la trajectoire, on interpole le colorant à cet endroit). Il sert uniquement à visualiser ; il n'agit pas sur le fluide. Les trois solveurs le calculent avec le même algorithme : à chaque pas, pour chaque cellule fluide, trajectoire rétrograde par Runge-Kutta à trois étages (`k1 = -u`, point à ½·k1, puis à ¾·k2, puis combinaison 2/9·k1 + 1/3·k2 + 4/9·k3) et interpolation bicubique de Lagrange 4×4 du colorant à l'arrivée (0 si un point sort de la grille) ; puis les émetteurs réécrivent leur valeur dans les cellules où ils sont actifs. Le colorant est affiché dans le canal alpha : `alpha = 1 − colorant`, qui fond la couleur vers le fond sombre.
@@ -219,6 +248,7 @@ Pour porter le moteur lui-même dans Unity, les kernels de `kernels.cl` sont du 
 - l'écoulement uniforme sans obstacle reste uniforme ; un obstacle crée bien un sillage ;
 - **Numba = NumPy** (écart maximal sur `u, v, ρ` < 5e-6) ; idem après un changement de Reynolds en cours de route ;
 - **OpenCL = NumPy** sur **chaque** device OpenCL utilisable (GPU et CPU) ; ignoré si aucun device ne fonctionne ;
+- **méthodes numériques** : pour les 12 combinaisons collision × entrée × sortie, Numba = NumPy et OpenCL = NumPy (sur chaque device) après 1, 50 et 300 pas (écart < 2e-5) ; une méthode inconnue est refusée ; à Re = 1e6 les collisions régularisée et Smagorinsky restent finies ;
 - **colorant** : une étape d'advection sur un colorant aléatoire (NumPy, Numba et OpenCL concordent à 1e-5), et une simulation avec émetteur sur 1, 10 et 30 pas (écart < 1e-4) ; le colorant reste nul sans émetteur.
 
 ---

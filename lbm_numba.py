@@ -8,11 +8,12 @@ import numpy as np
 import numba
 from numba import njit, prange
 
-from lbm_native import LBMNative, C, T, OPPOSITE
+from lbm_native import LBMNative, C, T, OPPOSITE, COLLISIONS, INLETS, OUTLETS, OUTLET_POPS
 
 _CX = C[:, 0].astype(np.int64)
 _CY = C[:, 1].astype(np.int64)
 _OPP = OPPOSITE.astype(np.int64)
+_OUT = np.array(OUTLET_POPS, dtype=np.int64)
 
 
 @njit(cache=True)
@@ -41,6 +42,75 @@ def _inlet(fin, ny, u_lb):
         for i in (1, 5, 8):
             cu = 3. * _CX[i] * u_lb
             fin[i, 0, y] = T[i] * rho * (1. + cu + 0.5 * cu * cu - usqr)
+
+
+@njit(cache=True)
+def _inlet_zouhe(fin, ny, u_lb):
+    """Left wall, Zou & He : same density as _inlet, populations 1, 5, 8 by bounce-back of the non-equilibrium part."""
+    for y in range(ny):
+        rho = (2. * (fin[3, 0, y] + fin[7, 0, y] + fin[6, 0, y])
+               + fin[0, 0, y] + fin[4, 0, y] + fin[2, 0, y]) / (1. - u_lb)
+        fin[1, 0, y] = fin[3, 0, y] + 2. / 3. * rho * u_lb
+        fin[5, 0, y] = fin[7, 0, y] - 0.5 * (fin[2, 0, y] - fin[4, 0, y]) + rho * u_lb / 6.
+        fin[8, 0, y] = fin[6, 0, y] + 0.5 * (fin[2, 0, y] - fin[4, 0, y]) + rho * u_lb / 6.
+
+
+@njit(cache=True)
+def _outlet_convective(fin, prev, nx, ny, uc):
+    """Outlet : the incoming populations are advected at the speed uc, from their value at the previous step (prev)."""
+    for y in range(ny):
+        for k in range(3):
+            new = (prev[k, y] + uc * fin[_OUT[k], nx - 2, y]) / (1. + uc)
+            fin[_OUT[k], nx - 1, y] = new
+            prev[k, y] = new
+
+
+@njit(parallel=True, cache=True)
+def _collision_reg(fin, fout, u, v, rhof, obstacle, omega0, cs_smag, smag, nx, ny):
+    """Regularized BGK collision, with a Smagorinsky local relaxation time if smag (see LBMNative)."""
+    for x in prange(nx):
+        f = np.empty(9)
+        fneq = np.empty(9)
+        for y in range(ny):
+            for i in range(9):
+                f[i] = fin[i, x, y]
+            if obstacle[x, y]:
+                for i in range(9):
+                    fout[i, x, y] = f[_OPP[i]]
+                continue
+            rho = 0.
+            jx = 0.
+            jy = 0.
+            for i in range(9):
+                rho += f[i]
+                jx += _CX[i] * f[i]
+                jy += _CY[i] * f[i]
+            ux = jx / rho
+            uy = jy / rho
+            u[x, y] = ux
+            v[x, y] = uy
+            rhof[x, y] = rho
+            usqr = 1.5 * (ux * ux + uy * uy)
+            pxx = 0.
+            pyy = 0.
+            pxy = 0.
+            for i in range(9):
+                cu = 3. * (_CX[i] * ux + _CY[i] * uy)
+                fneq[i] = f[i] - T[i] * rho * (1. + cu + 0.5 * cu * cu - usqr)
+                pxx += _CX[i] * _CX[i] * fneq[i]
+                pyy += _CY[i] * _CY[i] * fneq[i]
+                pxy += _CX[i] * _CY[i] * fneq[i]
+            omega = omega0
+            if smag:
+                tau0 = 1. / omega0
+                strain = np.sqrt(pxx * pxx + pyy * pyy + 2. * pxy * pxy)
+                omega = 2. / (tau0 + np.sqrt(tau0 * tau0 + 18. * np.sqrt(2.) * cs_smag * cs_smag * strain / rho))
+            for i in range(9):
+                cu = 3. * (_CX[i] * ux + _CY[i] * uy)
+                feq = T[i] * rho * (1. + cu + 0.5 * cu * cu - usqr)
+                q = 4.5 * T[i] * ((_CX[i] * _CX[i] - 1. / 3.) * pxx + (_CY[i] * _CY[i] - 1. / 3.) * pyy
+                                  + 2. * _CX[i] * _CY[i] * pxy)
+                fout[i, x, y] = feq + (1. - omega) * q
 
 
 @njit(parallel=True, cache=True)
@@ -166,12 +236,22 @@ def _emit(dye, emitters):
 
 
 @njit(cache=True)
-def _run(nb_iter, fin, fout, u, v, rhof, obstacle, m1s, nx, ny, u_lb, use_dye, dye, dye_read, emitters):
-    """nb_iter time steps. Returns the index of the dye copy that holds the latest dye field."""
+def _run(nb_iter, fin, fout, u, v, rhof, obstacle, m1s, nx, ny, u_lb, use_dye, dye, dye_read, emitters,
+         collision, inlet, outlet, omega, cs_smag, outlet_prev):
+    """nb_iter time steps. collision / inlet / outlet : index in COLLISIONS / INLETS / OUTLETS.
+    Returns the index of the dye copy that holds the latest dye field."""
     for _ in range(nb_iter):
         _bcs(fin, nx, ny)
-        _inlet(fin, ny, u_lb)
-        _collision(fin, fout, u, v, rhof, obstacle, m1s, nx, ny)
+        if outlet == 1:
+            _outlet_convective(fin, outlet_prev, nx, ny, u_lb)
+        if inlet == 1:
+            _inlet_zouhe(fin, ny, u_lb)
+        else:
+            _inlet(fin, ny, u_lb)
+        if collision == 0:
+            _collision(fin, fout, u, v, rhof, obstacle, m1s, nx, ny)
+        else:
+            _collision_reg(fin, fout, u, v, rhof, obstacle, omega, cs_smag, collision == 2, nx, ny)
         _streaming(fout, fin, nx, ny)
         if use_dye:
             _dye_advect(dye[dye_read], dye[1 - dye_read], u, v, obstacle, nx, ny)
@@ -195,7 +275,10 @@ class LBMNumba(LBMNative):
         dye = self.dye if use_dye else np.zeros((2, 1, 1), dtype=np.float32)
         self._dye_read = _run(int(nb_iter), self.fin, self.fout, self.u, self.v, self.rho, self.obstacle,
                               np.ascontiguousarray(self.M1S), self.nx, self.ny, float(self.uLB),
-                              use_dye, dye, self._dye_read, self._emitters)
+                              use_dye, dye, self._dye_read, self._emitters,
+                              COLLISIONS.index(self.collision_model), INLETS.index(self.inlet_model),
+                              OUTLETS.index(self.outlet_model), float(self.omega), float(self.cs_smag),
+                              self._outlet_prev)
         self.iteration += int(nb_iter)
 
 

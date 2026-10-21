@@ -98,8 +98,10 @@ class LBM_OCL:
   
         self.post_lbm_functions = [] # List of function run after one lbm step
         self.post_run_functions = [] # List of function run after a btach of lbm step
-        self.dye_emitters = None  
+        self.dye_emitters = None
         self.interop = False
+        # Numerical methods (see set_methods) : the original ones by default
+        self.collision_model, self.inlet_model, self.outlet_model, self.cs_smag = "mrt", "equilibrium", "zero_gradient", 0.1
         
     def init_data(self, lbm):
         """Create all the device buffers from the initial state of an LBM object (host -> device copy)."""
@@ -134,6 +136,11 @@ class LBM_OCL:
         self.ocl_fout58        = cl.Buffer(self.ocl_d.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=lbm.fout58)
         self.ocl_M1S        = cl.Buffer(self.ocl_d.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=lbm.M1S)
         self.ocl_vel_inlet = cl.Buffer(self.ocl_d.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=self.vel_inlet)
+        # Incoming populations 3, 6, 7 of the outlet column at the previous step (convective outlet)
+        outlet_prev = np.ascontiguousarray(np.stack([lbm.fin14.reshape(nx, ny, 4)[-1, :, 2],
+                                                     lbm.fin58.reshape(nx, ny, 4)[-1, :, 1],
+                                                     lbm.fin58.reshape(nx, ny, 4)[-1, :, 2]]), dtype=np.float32)
+        self.ocl_outlet_prev = cl.Buffer(self.ocl_d.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=outlet_prev)
 
         self.ocl_uvrho          = cl.Buffer(self.ocl_d.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=lbm.uvrho)
         
@@ -162,8 +169,23 @@ class LBM_OCL:
     
     def update_re(self, re):
         """Change the Reynolds number on the fly : recompute omega and the MRT matrix, and upload it."""
-        self.lbm.update_re(re) 
+        self.lbm.update_re(re)
         cl.enqueue_copy(self.ocl_d.queue, self.ocl_M1S,  self.lbm.M1S)
+
+    def set_methods(self, collision=None, inlet=None, outlet=None, smagorinsky=None):
+        """Choose the numerical methods (None keeps the current one), same names as lbm_native :
+        collision "mrt" (kernel moments) | "regularized" | "smagorinsky" (kernel moments_reg) ;
+        inlet "equilibrium" (bcs_inlet) | "zouhe" (bcs_inlet_zouhe) ; outlet "zero_gradient" (in bcs_sym) | "convective"."""
+        for name, value, allowed in (("collision", collision, ("mrt", "regularized", "smagorinsky")),
+                                     ("inlet", inlet, ("equilibrium", "zouhe")),
+                                     ("outlet", outlet, ("zero_gradient", "convective"))):
+            if value is not None and value not in allowed:
+                raise ValueError("unknown %s method %r (choose among %s)" % (name, value, allowed))
+        self.collision_model = collision or self.collision_model
+        self.inlet_model = inlet or self.inlet_model
+        self.outlet_model = outlet or self.outlet_model
+        if smagorinsky is not None:
+            self.cs_smag = float(smagorinsky)
     
     def enable_dye(self, dye):
         """Activate the dye. dye : float32 array (nx, ny, 2), two copies of the field used alternately
@@ -300,6 +322,28 @@ class LBM_OCL:
                         self.ocl_M1S, self.ocl_local_M1S,
                         self.ocl_obstacle)
         
+    def outlet_convective(self):
+        """Kernel bcs_outlet_convective : replaces the zero gradient of bcs_sym on the incoming populations."""
+        self.ocl_d.prg.bcs_outlet_convective(self.ocl_d.queue, self.shape_inlet, self.ocl_d.local_size_inlet,
+                        self.ocl_fin14, self.ocl_fin58, self.ocl_outlet_prev,
+                        np.int32(self.shape2D[0]), np.float32(self.lbm.uLB))
+
+    def moments_reg(self):
+        """Kernel moments_reg : regularized BGK collision (or Smagorinsky). fin -> fout."""
+        self.ocl_d.prg.moments_reg(self.ocl_d.queue, self.shape2D, self.ocl_d.local_size_2D,
+                        self.ocl_fout0, self.ocl_fout14, self.ocl_fout58,
+                        self.ocl_uvrho,
+                        self.ocl_fin0, self.ocl_fin14, self.ocl_fin58,
+                        self.ocl_obstacle,
+                        np.float32(self.lbm.omega), np.float32(self.cs_smag),
+                        np.int32(self.collision_model == "smagorinsky"))
+
+    def inlet_zouhe(self):
+        """Kernel bcs_inlet_zouhe : left boundary, imposed velocity (Zou & He). One work-item per row."""
+        self.ocl_d.prg.bcs_inlet_zouhe(self.ocl_d.queue, self.shape_inlet, self.ocl_d.local_size_inlet,
+                        self.ocl_fin0, self.ocl_fin14, self.ocl_fin58,
+                        self.ocl_uvrho, self.ocl_vel_inlet)
+
     def inlet(self):
         """Kernel bcs_inlet : left boundary, imposed velocity. One work-item per row."""
         self.ocl_d.prg.bcs_inlet(self.ocl_d.queue, self.shape_inlet, self.ocl_d.local_size_inlet,
@@ -365,9 +409,17 @@ class LBM_OCL:
         """Advance the simulation by nb_iter time steps, then draw the registered images.
         Kernels are only queued : call queue.finish() (or read a result) to wait for them."""
         for i in range(nb_iter):            
-            self.bcs_sym()             
-            self.inlet()
-            self.moments()
+            self.bcs_sym()
+            if self.outlet_model == "convective":
+                self.outlet_convective()
+            if self.inlet_model == "zouhe":
+                self.inlet_zouhe()
+            else:
+                self.inlet()
+            if self.collision_model == "mrt":
+                self.moments()
+            else:
+                self.moments_reg()
             self.streaming()              
             self.post_lbm()
         self.post_run()

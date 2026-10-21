@@ -164,7 +164,7 @@ class OpenCLMatchesNumpy(unittest.TestCase):
         obstacle = make_obstacle()
         for device in ocl_driver.list_devices():
             with self.subTest(device="%s : %s" % (device["type"], device["name"])):
-                config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, device=device["id"])
+                config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, collision="mrt", device=device["id"])
                 backend = ss.OpenCLBackend(config)
                 backend.set_obstacle(obstacle)
                 reference = lbm_native.LBMNative(RE, NY / 2, NX, NY)
@@ -195,7 +195,7 @@ class DyeOpenCLMatchesNumpy(unittest.TestCase):
         for device in ocl_driver.list_devices():
             with self.subTest(device="%s : %s" % (device["type"], device["name"])):
                 import pyopencl as cl
-                config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, device=device["id"])
+                config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, collision="mrt", device=device["id"])
                 backend = ss.OpenCLBackend(config)
                 solver = backend.lbm_ocl
                 solver.update_obstacle(obstacle)
@@ -212,7 +212,7 @@ class DyeOpenCLMatchesNumpy(unittest.TestCase):
         obstacle = make_obstacle()
         for device in ocl_driver.list_devices():
             with self.subTest(device="%s : %s" % (device["type"], device["name"])):
-                config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, device=device["id"])
+                config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, collision="mrt", device=device["id"])
                 backend = ss.OpenCLBackend(config)
                 backend.set_obstacle(obstacle)
                 solver = backend.lbm_ocl
@@ -232,6 +232,74 @@ class DyeOpenCLMatchesNumpy(unittest.TestCase):
                     done = target
                     diff = np.abs(reference.get_dye() - solver.get_dye())[~obstacle].max()
                     self.assertLess(diff, DYE_TOLERANCE, "step %d" % target)
+
+
+METHODS = [(c, i, o) for c in lbm_native.COLLISIONS for i in lbm_native.INLETS for o in lbm_native.OUTLETS]
+METHOD_STEPS = (1, 50, 300)
+
+
+def reference_after(methods, steps, obstacle, re=RE):
+    model = lbm_native.LBMNative(re, NY / 2, NX, NY)
+    model.set_methods(*methods)
+    model.set_obstacle(obstacle)
+    model.run(steps)
+    return model.get_fields()
+
+
+class MethodsNumbaMatchesNumpy(unittest.TestCase):
+    def test_every_method_combination(self):
+        """Regularized / Smagorinsky collisions, Zou-He inlet, convective outlet : Numba = NumPy."""
+        obstacle = make_obstacle()
+        for methods in METHODS:
+            with self.subTest(methods=methods):
+                model = lbm_numba.LBMNumba(RE, NY / 2, NX, NY)
+                model.set_methods(*methods)
+                model.set_obstacle(obstacle)
+                done = 0
+                for target in METHOD_STEPS:
+                    model.run(target - done)
+                    done = target
+                    diffs = max_differences(reference_after(methods, target, obstacle), model.get_fields(), ~obstacle)
+                    self.assertLess(max(diffs), TOLERANCE * 4, "step %d : %s" % (target, diffs))
+
+    def test_unknown_method_is_refused(self):
+        model = lbm_native.LBMNative(RE, NY / 2, NX, NY)
+        with self.assertRaises(ValueError):
+            model.set_methods(collision="bgk")
+
+    def test_methods_stay_stable_at_high_reynolds(self):
+        """Re = 1e6 on a small grid : regularized and Smagorinsky collisions stay finite and bounded."""
+        obstacle = make_obstacle()
+        for methods in (("regularized", "zouhe", "convective"), ("smagorinsky", "zouhe", "convective")):
+            with self.subTest(methods=methods):
+                u, v, rho = reference_after(methods, 600, obstacle, re=1e6)
+                self.assertTrue(np.isfinite(u).all() and np.isfinite(rho).all())
+                self.assertLess(np.abs(u).max(), 0.3)
+
+
+@unittest.skipUnless(opencl_available(), "no working OpenCL device")
+class MethodsOpenCLMatchesNumpy(unittest.TestCase):
+    def test_every_method_combination_on_every_device(self):
+        obstacle = make_obstacle()
+        for device in ocl_driver.list_devices():
+            config = dict(ss.DEFAULT_CONFIG, nx=NX, ny=NY, re=RE, dye=False, collision="mrt", device=device["id"])
+            backend = ss.OpenCLBackend(config)
+            backend.set_obstacle(obstacle)
+            for methods in METHODS:
+                with self.subTest(device="%s : %s" % (device["type"], device["name"]), methods=methods):
+                    solver = lbm_opencl.LBM_OCL(backend.ocl_d)
+                    solver.init_data(lbm_opencl.LBM(RE, NY / 2, NX, NY))
+                    solver.update_obstacle(obstacle)
+                    solver.set_methods(*methods)
+                    done = 0
+                    for target in METHOD_STEPS:
+                        solver.run(target - done)
+                        backend.queue.finish()
+                        done = target
+                        uvrho = solver.get_rho_u_v()
+                        fields = (uvrho[:, :, 0], uvrho[:, :, 1], uvrho[:, :, 2])
+                        diffs = max_differences(reference_after(methods, target, obstacle), fields, ~obstacle)
+                        self.assertLess(max(diffs), TOLERANCE * 4, "step %d : %s" % (target, diffs))
 
 
 if __name__ == "__main__":

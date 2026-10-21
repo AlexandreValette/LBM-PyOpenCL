@@ -11,6 +11,12 @@ so both can be compared field by field :
     top / bottom (y = 0, ny-1) periodic for the unknown populations, bounce-back on obstacles
   - optional passive dye, advected like the OpenCL one (kernels dye_bipolyinter / update_dye_emitter)
 It is much slower than the OpenCL solver : meant as a readable reference.
+
+Selectable numerical methods (set_methods), the first of each list being the original one :
+  - collision : "mrt" ; "regularized" (BGK with the non-equilibrium part projected on the stress tensor, Latt & Chopard
+                2006) ; "smagorinsky" (regularized + local eddy viscosity of the Smagorinsky model, Hou et al. 1996)
+  - inlet     : "equilibrium" (unknown populations 1, 5, 8 at equilibrium) ; "zouhe" (Zou & He 1997)
+  - outlet    : "zero_gradient" ; "convective" (the incoming populations are advected at the velocity uLB)
 """
 import numpy as np
 
@@ -18,6 +24,12 @@ import numpy as np
 C = np.array([[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-1, 1], [-1, -1], [1, -1]], dtype=np.int8)
 T = np.array([4./9., 1./9., 1./9., 1./9., 1./9., 1./36., 1./36., 1./36., 1./36.])
 OPPOSITE = np.array([0, 3, 4, 1, 2, 7, 8, 5, 6])
+
+# Selectable numerical methods (see set_methods)
+COLLISIONS = ("mrt", "regularized", "smagorinsky")
+INLETS = ("equilibrium", "zouhe")
+OUTLETS = ("zero_gradient", "convective")
+OUTLET_POPS = (3, 6, 7)        # populations entering through the outlet
 
 # Moments (rho, e, eps, jx, qx, jy, qy, pxx, pxy) of the populations
 M = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1],
@@ -52,6 +64,10 @@ class LBMNative:
         self.fin = self._equilibrium(self.rho, self.u, self.v).astype(dtype)
         self.iteration = 0
 
+        self.collision_model, self.inlet_model, self.outlet_model, self.cs_smag = "mrt", "equilibrium", "zero_gradient", 0.1
+        # Value of the incoming populations at the outlet at the previous step (convective outlet)
+        self._outlet_prev = self.fin[list(OUTLET_POPS), -1, :].copy()
+
         # Passive dye (see enable_dye) : two copies of the field, read / written alternately
         self.dye = None
         self._dye_read = 0
@@ -67,6 +83,19 @@ class LBMNative:
         s = np.array([0., 1.4, 1.4, 0., 1.2, 0., 1.2, self.omega, self.omega])
         self.M = M.astype(self.dtype)
         self.M1S = (np.linalg.inv(M) @ np.diag(s)).astype(self.dtype)
+
+    def set_methods(self, collision=None, inlet=None, outlet=None, smagorinsky=None):
+        """Choose the numerical methods (None keeps the current one) : see COLLISIONS, INLETS, OUTLETS.
+        smagorinsky : constant Cs of the eddy viscosity (0.1 - 0.17 usually), used by the "smagorinsky" collision."""
+        for name, value, allowed in (("collision", collision, COLLISIONS), ("inlet", inlet, INLETS),
+                                     ("outlet", outlet, OUTLETS)):
+            if value is not None and value not in allowed:
+                raise ValueError("unknown %s method %r (choose among %s)" % (name, value, allowed))
+        self.collision_model = collision or self.collision_model
+        self.inlet_model = inlet or self.inlet_model
+        self.outlet_model = outlet or self.outlet_model
+        if smagorinsky is not None:
+            self.cs_smag = float(smagorinsky)
 
     def set_obstacle(self, obstacle):
         """obstacle : boolean array (nx, ny), True on solid cells."""
@@ -185,6 +214,12 @@ class LBMNative:
         f[[4, 7, 8], :, -1] = f[[4, 7, 8], :, 0]       # top wall    <- bottom row
         f[[2, 5, 6], :, 0] = f[[2, 5, 6], :, -1]       # bottom wall <- top row
         f[[3, 6, 7], -1, :] = f[[3, 6, 7], -2, :]      # outlet      <- previous column
+        if self.outlet_model == "convective":
+            # f_i(outlet, t+1) = (f_i(outlet, t) + uc f_i(outlet-1, t+1)) / (1 + uc) : advection at the speed uc
+            uc = self.uLB
+            new = (self._outlet_prev + uc * f[list(OUTLET_POPS), -2, :]) / (1. + uc)
+            f[list(OUTLET_POPS), -1, :] = new
+            self._outlet_prev = new
 
     def _inlet(self):
         """Left wall : velocity (uLB, 0) imposed, density from the known populations,
@@ -192,12 +227,49 @@ class LBMNative:
         f = self.fin[:, 0, :]
         ux = self.uLB
         rho = (2. * (f[3] + f[7] + f[6]) + f[0] + f[4] + f[2]) / (1. - ux)
+        if self.inlet_model == "zouhe":
+            # Zou & He : bounce-back of the non-equilibrium part, which gives the right momentum and stress
+            f[1] = f[3] + 2. / 3. * rho * ux
+            f[5] = f[7] - 0.5 * (f[2] - f[4]) + rho * ux / 6.
+            f[8] = f[6] + 0.5 * (f[2] - f[4]) + rho * ux / 6.
+            return
         for i in (1, 5, 8):
             cu = 3. * C[i, 0] * ux
             f[i] = T[i] * rho * (1. + cu + 0.5 * cu * cu - 1.5 * ux * ux)
 
+    def _collision_regularized(self):
+        """Regularized BGK collision (and Smagorinsky if selected), bounce-back on obstacles.
+        f_out = feq + (1 - omega) fneq_reg, where fneq_reg keeps only the part of f - feq carried by the stress tensor
+        Pi = sum_i c_i c_i (f_i - feq_i) : fneq_reg_i = w_i / (2 cs^4) (c_i c_i - cs^2 I) : Pi. This removes the
+        non-hydrodynamic (ghost) modes that make BGK unstable at low viscosity."""
+        f = self.fin
+        cx = C[:, 0, None, None].astype(f.dtype)
+        cy = C[:, 1, None, None].astype(f.dtype)
+        rho = f.sum(axis=0)
+        ux = (cx * f).sum(axis=0) / rho
+        uy = (cy * f).sum(axis=0) / rho
+        fneq = f - self._equilibrium(rho, ux, uy)
+        pxx, pyy, pxy = (cx * cx * fneq).sum(axis=0), (cy * cy * fneq).sum(axis=0), (cx * cy * fneq).sum(axis=0)
+        omega = self.omega
+        if self.collision_model == "smagorinsky":
+            # Local relaxation time : tau = (tau0 + sqrt(tau0^2 + 18 sqrt(2) Cs^2 |Pi| / rho)) / 2
+            tau0 = 1. / self.omega
+            strain = np.sqrt(pxx * pxx + pyy * pyy + 2. * pxy * pxy)
+            omega = 2. / (tau0 + np.sqrt(tau0 * tau0 + 18. * np.sqrt(2.) * self.cs_smag ** 2 * strain / rho))
+        fneq_reg = 4.5 * T[:, None, None] * ((cx * cx - 1. / 3.) * pxx + (cy * cy - 1. / 3.) * pyy + 2. * cx * cy * pxy)
+        fout = self._equilibrium(rho, ux, uy) + (1. - omega) * fneq_reg
+        fout = fout.astype(self.dtype)
+
+        solid = self.obstacle
+        fout[:, solid] = f[OPPOSITE][:, solid]
+        fluid = ~solid
+        self.u[fluid], self.v[fluid], self.rho[fluid] = ux[fluid], uy[fluid], rho[fluid]
+        return fout
+
     def _collision(self):
         """MRT collision on fluid cells, bounce-back on obstacles."""
+        if self.collision_model != "mrt":
+            return self._collision_regularized()
         f = self.fin.reshape(9, -1)
         m = self.M @ f
         rho, jx, jy = m[0], m[3], m[5]

@@ -44,7 +44,7 @@
   .status { display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: baseline; }
   .status b { font-variant-numeric: tabular-nums; }
   .status .k { color: var(--muted); margin-right: 4px; }
-  #state.error, #error { color: var(--danger); }
+  #state.error, #error, #mach.error { color: var(--danger); }
   #view { position: relative; overflow: hidden; background: var(--view-bg); border-radius: 8px;
           border: 1px solid var(--border); width: 100%; cursor: grab; touch-action: none; }
   #view.dragging { cursor: grabbing; }
@@ -67,16 +67,29 @@
         <label>Grille ny <input id="ny" type="number" min="64" max="2048" step="32" value="256"><span></span></label>
         <label>Speedup <input id="speedup" type="number" min="0.1" max="3" step="0.1" value="1"><span></span></label>
         <label class="check"><input id="dye" type="checkbox" checked> Colorant (émetteur à l'entrée)</label>
-        <label>Colorant y <input id="dye_y" type="range" min="0.05" max="0.95" step="0.01" value="0.5"><span class="val"></span></label>
       </fieldset>
 
       <fieldset>
         <legend>Écoulement <span class="hint">(en direct)</span></legend>
         <label>Reynolds <input id="re_log" type="range" min="2" max="7" step="0.05" value="4"><span class="val" id="re_val"></span></label>
         <label>Pas / image <input id="iter_per_frame" type="range" min="1" max="50" step="1" value="10"><span class="val"></span></label>
+        <label>Colorant y <input id="dye_y" type="range" min="0.05" max="0.95" step="0.01" value="0.5"><span class="val"></span></label>
+        <label>Colorant couleur <input id="dye_color" type="color" value="#030303"><span></span></label>
+        <label>Colorant cadence <input id="dye_freq" type="range" min="1" max="50" step="1" value="10"><span class="val"></span></label>
         <label>Affichage <select id="display"><option value="norm">Norme de la vitesse</option><option value="curl">Rotationnel</option></select><span></span></label>
         <label>Échelle vitesse <input id="t_max" type="range" min="0.01" max="0.2" step="0.005" value="0.08"><span class="val"></span></label>
         <label>Échelle rotat. <input id="curl_max" type="range" min="0.005" max="0.1" step="0.005" value="0.03"><span class="val"></span></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Méthodes numériques <span class="hint">(en direct)</span></legend>
+        <label>Collision <select id="collision" title="MRT : méthode d'origine. Régularisée et Smagorinsky : plus stables à haut Reynolds">
+          <option value="mrt">MRT (origine)</option><option value="regularized">Régularisée</option><option value="smagorinsky">Régularisée + Smagorinsky</option></select><span></span></label>
+        <label>Constante Cs <input id="smagorinsky" type="range" min="0.05" max="0.25" step="0.01" value="0.1" title="Smagorinsky : viscosité turbulente ajoutée ; plus Cs est grand, plus l'écoulement est lissé"><span class="val"></span></label>
+        <label>Entrée <select id="inlet" title="Condition de vitesse imposée à gauche">
+          <option value="equilibrium">Équilibre (origine)</option><option value="zouhe">Zou-He</option></select><span></span></label>
+        <label>Sortie <select id="outlet" title="Condition à droite">
+          <option value="zero_gradient">Gradient nul (origine)</option><option value="convective">Convective</option></select><span></span></label>
       </fieldset>
 
       <fieldset>
@@ -103,6 +116,9 @@
     <span><span class="k">Solveur</span><b id="devtext">–</b></span>
     <span><span class="k">Grille</span><b id="grid">–</b></span>
     <span><span class="k">Itération</span><b id="iteration">–</b></span>
+    <span title="Temps de relaxation (1/ω) : plus il est proche de 0,5, plus la simulation est instable"><span class="k">τ</span><b id="tau">–</b></span>
+    <span title="Mach maximal : la méthode n'est valable que pour Ma &lt; ~0,3 (0,1 idéalement)"><span class="k">Mach max</span><b id="mach">–</b></span>
+    <span title="Densité moyenne : doit rester proche de 1"><span class="k">ρ moy.</span><b id="rho_mean">–</b></span>
   </section>
 
   <div id="view"><canvas id="screen" width="512" height="256"></canvas></div>
@@ -111,7 +127,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const LIVE = ["re", "iter_per_frame", "display", "t_max", "curl_max",
+const LIVE = ["re", "iter_per_frame", "display", "t_max", "curl_max", "dye_y", "dye_freq", "dye_color", "collision", "inlet", "outlet", "smagorinsky",
               "obstacle_file", "obstacle_x", "obstacle_y", "obstacle_rotation", "obstacle_scale"];
 let ws = null, running = false, defaults = null;
 
@@ -119,7 +135,8 @@ let ws = null, running = false, defaults = null;
 function readConfig() {
   return {
     solver: $("solver").value, threads: +$("threads").value, device: +$("device").value, nx: +$("nx").value, ny: +$("ny").value, speedup: +$("speedup").value,
-    dye: $("dye").checked, dye_y: +$("dye_y").value,
+    dye: $("dye").checked, dye_y: +$("dye_y").value, dye_freq: +$("dye_freq").value, dye_color: $("dye_color").value,
+    collision: $("collision").value, inlet: $("inlet").value, outlet: $("outlet").value, smagorinsky: +$("smagorinsky").value,
     re: Math.pow(10, +$("re_log").value), iter_per_frame: +$("iter_per_frame").value,
     display: $("display").value, t_max: +$("t_max").value, curl_max: +$("curl_max").value,
     obstacle_file: $("obstacle_file").value, obstacle_x: +$("obstacle_x").value, obstacle_y: +$("obstacle_y").value,
@@ -180,6 +197,11 @@ function onStats(s) {
   $("devtext").textContent = s.device || "–";
   $("grid").textContent = s.grid.join(" × ");
   $("iteration").textContent = s.iteration.toLocaleString("fr-FR");
+  // Stability indicators (absent until the first measure)
+  $("tau").textContent = s.tau === undefined ? "–" : s.tau.toFixed(5);
+  $("mach").textContent = s.mach === undefined ? "–" : s.mach.toFixed(3);
+  $("mach").className = s.mach > 0.3 ? "error" : "";
+  $("rho_mean").textContent = s.rho_mean === undefined ? "–" : s.rho_mean.toFixed(4);
   $("error").textContent = s.error || "";
   running = s.state === "running" || s.state === "starting";
 }
@@ -238,7 +260,8 @@ async function init() {
 function applyDefaults() {
   const d = defaults;
   $("solver").value = d.solver; $("threads").value = d.threads; $("device").value = d.device; $("nx").value = d.nx; $("ny").value = d.ny; $("speedup").value = d.speedup;
-  $("dye").checked = d.dye; $("dye_y").value = d.dye_y; $("re_log").value = Math.log10(d.re);
+  $("dye").checked = d.dye; $("dye_y").value = d.dye_y; $("dye_freq").value = d.dye_freq; $("dye_color").value = d.dye_color; $("re_log").value = Math.log10(d.re);
+  $("collision").value = d.collision; $("inlet").value = d.inlet; $("outlet").value = d.outlet; $("smagorinsky").value = d.smagorinsky;
   $("iter_per_frame").value = d.iter_per_frame; $("display").value = d.display;
   $("t_max").value = d.t_max; $("curl_max").value = d.curl_max;
   $("obstacle_file").value = d.obstacle_file; $("obstacle_x").value = d.obstacle_x; $("obstacle_y").value = d.obstacle_y;

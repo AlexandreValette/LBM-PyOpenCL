@@ -25,7 +25,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OBSTACLE_DIR = os.path.join(BASE_DIR, "world_objects")
 
 # Parameters that can be changed while the simulation is running
-LIVE_KEYS = ("re", "iter_per_frame", "display", "t_min", "t_max", "curl_max",
+LIVE_KEYS = ("re", "iter_per_frame", "display", "t_min", "t_max", "curl_max", "dye_y", "dye_freq", "dye_color", "collision", "inlet", "outlet", "smagorinsky",
              "obstacle_file", "obstacle_x", "obstacle_y", "obstacle_rotation", "obstacle_scale")
 
 
@@ -48,7 +48,12 @@ DEFAULT_CONFIG = {
     "obstacle_file": "FlatPlane.txt",   # file of world_objects/, "" for none
     "obstacle_x": 0.25, "obstacle_y": 0.5,   # position, as a fraction of the grid
     "obstacle_rotation": 45.0, "obstacle_scale": 0.14,
-    "dye": True, "dye_y": 0.5, "dye_freq": 10,   # passive dye : emitter at the inlet, refreshed every dye_freq frames
+    "dye": True, "dye_y": 0.5, "dye_freq": 10, "dye_color": "#030303",   # passive dye : emitter at the inlet, refreshed every dye_freq frames
+    # Numerical methods (see lbm_native.py) : the first of each list is the original one
+    "collision": "smagorinsky",     # "mrt", "regularized" or "smagorinsky" (default : stable up to Re = 1e7, see DOCUMENTATION.md)
+    "inlet": "equilibrium",         # "equilibrium" or "zouhe"
+    "outlet": "zero_gradient",      # "zero_gradient" or "convective"
+    "smagorinsky": 0.1,             # constant Cs of the Smagorinsky collision
     "jpeg_quality": 85,
 }
 
@@ -58,6 +63,18 @@ def list_obstacles():
     if not os.path.isdir(OBSTACLE_DIR):
         return []
     return sorted(f for f in os.listdir(OBSTACLE_DIR) if f.lower().endswith(".txt"))
+
+
+def _dye_rgb(c):
+    """Dye color "#rrggbb" -> (r, g, b) in 0..1."""
+    h = str(c["dye_color"]).lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255. for i in (0, 2, 4))
+
+
+def _dye_rect(c):
+    """Dye emitter at the inlet : (cx_min, cx_max, cy_min, cy_max, value, life in steps), 3 cells high around dye_y."""
+    cy = int(float(c["dye_y"]) * c["ny"])
+    return (1, 2, max(cy - 1, 1), min(cy + 2, c["ny"] - 1), 1., 100)
 
 
 class ObstacleBuilder:
@@ -89,6 +106,7 @@ class OpenCLBackend:
         import pyopencl as cl
         import lbm_opencl
         self._cl = cl
+        self._lbm_opencl = lbm_opencl
         self.c = c
         nx, ny = c["nx"], c["ny"]
         is_cpu = ocl_driver.list_devices()[int(c["device"])]["type"] == "CPU"
@@ -101,6 +119,8 @@ class OpenCLBackend:
         self.lbm = lbm_opencl.LBM(float(c["re"]), ny / 2, nx, ny, speedup=float(c["speedup"]))
         self.lbm_ocl = lbm_opencl.LBM_OCL(self.ocl_d)
         self.lbm_ocl.init_data(self.lbm)
+        self._obstacle = np.zeros((nx, ny), dtype=bool)
+        self._apply_methods()
 
         fmt = cl.ImageFormat(cl.channel_order.RGBA, cl.channel_type.FLOAT)
         self.image = cl.create_image(self.ocl_d.ctx, cl.mem_flags.READ_WRITE, fmt, shape=(nx, ny))
@@ -112,16 +132,35 @@ class OpenCLBackend:
         if c["dye"]:
             self.lbm_ocl.enable_dye(np.zeros((nx, ny, 2), dtype=np.float32))
             self.dye_emitters = lbm_opencl.DyeEmitter(self.lbm_ocl.shape2D)
-            cy = int(float(c["dye_y"]) * ny)
-            self.dye_rects.append(lbm_opencl.RectDye(1, 2, max(cy - 1, 1), min(cy + 2, ny - 1), 1., 100))
+            self.dye_rects.append(lbm_opencl.RectDye(*_dye_rect(c)))
 
     def set_obstacle(self, obstacle):
+        self._obstacle = obstacle
         self.lbm_ocl.update_obstacle(obstacle)
+
+    def _apply_methods(self):
+        c = self.c
+        self.lbm_ocl.set_methods(c["collision"], c["inlet"], c["outlet"], float(c["smagorinsky"]))
+
+    def diagnostics_fields(self):
+        """(u, v, rho, solid) read back from the device, for the stability indicators."""
+        uvrho = self.lbm_ocl.get_rho_u_v()
+        return uvrho[:, :, 0], uvrho[:, :, 1], uvrho[:, :, 2], self._obstacle
+
+    def tau(self):
+        return 1. / self.lbm.omega
 
     def update(self, old):
         c = self.c
+        if any(c[k] != old[k] for k in ("collision", "inlet", "outlet", "smagorinsky")):
+            self._apply_methods()
         if c["re"] != old["re"]:
             self.lbm_ocl.update_re(float(c["re"]))
+        if c["dye_y"] != old["dye_y"] and self.dye_rects:
+            # Forget the emitters of the old position (they would keep emitting up to 100 steps), emit now
+            self.dye_rects[0] = self._lbm_opencl.RectDye(*_dye_rect(c))
+            self.dye_emitters = self._lbm_opencl.DyeEmitter(self.lbm_ocl.shape2D)
+            self._emit_dye = self._counter
         if c["display"] != old["display"]:
             self._set_display(c["display"])
         if any(c[k] != old[k] for k in ("t_min", "t_max", "curl_max", "display")):
@@ -141,8 +180,8 @@ class OpenCLBackend:
         self._cl.enqueue_copy(self.queue, self._host_image, self.image,
                               origin=(0, 0), region=(self.c["nx"], self.c["ny"])).wait()
         rgb, alpha = self._host_image[:, :, :3], self._host_image[:, :, 3:4]
-        # The dye lives in the alpha channel : it fades the color to the dark background
-        img = np.clip(rgb * alpha + 0.01 * (1. - alpha), 0., 1.)
+        # The dye lives in the alpha channel : it fades the color towards the dye color
+        img = np.clip(rgb * alpha + np.asarray(_dye_rgb(self.c)) * (1. - alpha), 0., 1.)
         return (img[::-1] * 255).astype(np.uint8)       # y axis points up
 
     def _set_display(self, mode):
@@ -165,11 +204,11 @@ class NativeBackend:
         self.c = c
         self.lbm = self._make_model()
         self.device_text = self._device_text()
+        self._apply_methods()
         self._dye_rect, self._counter, self._emit_dye = None, 0, 0
         if c["dye"]:
             self.lbm.enable_dye()
-            cy = int(float(c["dye_y"]) * c["ny"])
-            self._dye_rect = (1, 2, max(cy - 1, 1), min(cy + 2, c["ny"] - 1), 1., 100)
+            self._dye_rect = _dye_rect(c)
 
     def _make_model(self):
         import lbm_native
@@ -182,9 +221,27 @@ class NativeBackend:
     def set_obstacle(self, obstacle):
         self.lbm.set_obstacle(obstacle)
 
+    def _apply_methods(self):
+        c = self.c
+        self.lbm.set_methods(c["collision"], c["inlet"], c["outlet"], float(c["smagorinsky"]))
+
+    def diagnostics_fields(self):
+        """(u, v, rho, solid) for the stability indicators."""
+        u, v, rho = self.lbm.get_fields()
+        return u, v, rho, self.lbm.obstacle
+
+    def tau(self):
+        return 1. / self.lbm.omega
+
     def update(self, old):
+        if any(self.c[k] != old[k] for k in ("collision", "inlet", "outlet", "smagorinsky")):
+            self._apply_methods()
         if self.c["re"] != old["re"]:
             self.lbm.update_re(float(self.c["re"]))
+        if self._dye_rect and self.c["dye_y"] != old["dye_y"]:
+            self._dye_rect = _dye_rect(self.c)
+            self.lbm._emitters = np.zeros((0, 4), dtype=np.float32)    # drop the emitters of the old position
+            self._emit_dye = self._counter
 
     def step(self, iters):
         if self._dye_rect and self._counter == self._emit_dye:      # same schedule as OpenCLBackend
@@ -199,9 +256,11 @@ class NativeBackend:
         dye = self.lbm.get_dye() if self.lbm.dye is not None else None
         k = float(c["speedup"])          # same scaling as LBM_OCL.set_texture_min_max
         if c["display"] == "curl":
-            return tools.render_field(u, v, self.lbm.obstacle, "curl", vmax=float(c["curl_max"]) * k, dye=dye)
+            return tools.render_field(u, v, self.lbm.obstacle, "curl", vmax=float(c["curl_max"]) * k, dye=dye,
+                                     dye_color=_dye_rgb(c))
         return tools.render_field(u, v, self.lbm.obstacle, "norm",
-                                  vmin=float(c["t_min"]) * k, vmax=float(c["t_max"]) * k, dye=dye)
+                                  vmin=float(c["t_min"]) * k, vmax=float(c["t_max"]) * k, dye=dye,
+                                  dye_color=_dye_rgb(c))
 
 
 class NumbaBackend(NativeBackend):
@@ -232,6 +291,7 @@ class SimulationSession:
         self.error = None
         self.device_text = ""
         self.iteration = 0
+        self.diagnostics = {}         # tau, mach (max), rho_mean : refreshed twice a second
 
         self._thread = None
         self._stop = threading.Event()
@@ -272,7 +332,7 @@ class SimulationSession:
         return {"type": "stats", "state": self.state, "error": self.error,
                 "fps": round(fps, 1), "mlups": round(fps * iters * nx * ny / 1e6, 1),
                 "iteration": self.iteration, "device": self.device_text,
-                "grid": [nx, ny]}
+                "grid": [nx, ny], **self.diagnostics}
 
     # ---------------------------------------------------------------- worker thread
     def _run(self):
@@ -283,12 +343,17 @@ class SimulationSession:
             obstacles = ObstacleBuilder(c["nx"], c["ny"])
             backend.set_obstacle(obstacles.build(c))
             self.state = "running"
+            last_diagnostics = 0.
             while not self._stop.is_set():
                 self._apply_pending(backend, obstacles)
                 iters = int(c["iter_per_frame"])
                 backend.step(iters)
                 self.iteration += iters
-                self._loop_times.append(time.perf_counter())
+                now = time.perf_counter()
+                self._loop_times.append(now)
+                if now - last_diagnostics > 0.5:
+                    last_diagnostics = now
+                    self._check_stability(backend)
                 if self._frame_requested.is_set():
                     self._frame_requested.clear()
                     self._frame = (self._frame[0] + 1, self._jpeg(backend.render()))
@@ -297,6 +362,18 @@ class SimulationSession:
             traceback.print_exc()
             self.error = "%s: %s" % (type(exc).__name__, exc)
             self.state = "error"
+
+    def _check_stability(self, backend):
+        """Stability indicators : relaxation time tau, maximum Mach number (u_max / cs, cs = 1/sqrt(3)) and mean density.
+        Stops the simulation with an explicit error when the fields are no longer finite (the run has diverged)."""
+        u, v, rho, solid = backend.diagnostics_fields()
+        fluid = ~solid
+        speed, density = np.hypot(u, v)[fluid], rho[fluid]
+        if not (np.isfinite(speed).all() and np.isfinite(density).all()) or density.min() <= 0.:
+            raise ArithmeticError("la simulation a divergé (valeurs non finies) : baisser le Reynolds ou choisir une "
+                                  "collision plus stable (régularisée / Smagorinsky)")
+        self.diagnostics = {"tau": round(backend.tau(), 6), "mach": round(float(speed.max()) * 3 ** 0.5, 3),
+                            "rho_mean": round(float(density.mean()), 5)}
 
     def _apply_pending(self, backend, obstacles):
         with self._lock:

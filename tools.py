@@ -68,13 +68,14 @@ COLORMAP = np.array([[0.2298057,   0.298717966, 0.753683153],
 OBSTACLE_COLOR = (0., 0.5, 0.)
 
 
-def render_field(u, v, obstacle, mode="norm", vmin=0., vmax=0.1, dye=None):
+def render_field(u, v, obstacle, mode="norm", vmin=0., vmax=0.1, dye=None, dye_color=(0.01, 0.01, 0.01)):
     """Color image of a velocity field, like the OpenCL display kernels.
 
     u, v, obstacle : arrays (nx, ny)
     mode           : "norm" (velocity norm, from vmin to vmax) or "curl" (signed curl, -vmax to +vmax)
-    dye            : optional dye field (nx, ny) : it fades the colors to the dark background (alpha = 1 - dye),
+    dye            : optional dye field (nx, ny) : it fades the colors towards dye_color (alpha = 1 - dye),
                      like dye_to_texture in the OpenCL solver
+    dye_color      : RGB (0..1) of the dye, almost black by default
     returns        : uint8 array (ny, nx, 3), first row = top (y axis pointing up)
     """
     if mode == "curl":
@@ -89,5 +90,5 @@ def render_field(u, v, obstacle, mode="norm", vmin=0., vmax=0.1, dye=None):
     rgb[obstacle] = OBSTACLE_COLOR
     if dye is not None:
         alpha = (1. - dye)[..., None]
-        rgb = np.clip(rgb * alpha + 0.01 * (1. - alpha), 0., 1.)
+        rgb = np.clip(rgb * alpha + np.asarray(dye_color) * (1. - alpha), 0., 1.)
     return (rgb.transpose(1, 0, 2)[::-1] * 255).astype(np.uint8)

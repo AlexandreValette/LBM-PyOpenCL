@@ -96,6 +96,76 @@ __kernel void
       }
     }
     
+// Regularized BGK collision (Latt & Chopard 2006), with an optional Smagorinsky local relaxation time (Hou et al. 1996).
+// Alternative to `moments` : f_out = feq + (1 - omega) fneq_reg, where fneq_reg keeps only the part of f - feq carried
+// by the stress tensor. use_smag != 0 : omega is replaced by a local value that grows with the strain (eddy viscosity).
+// Same output as `moments` : fout, and (u, v, rho) in uvrho. Obstacles : bounce-back.
+__kernel void
+    moments_reg(
+        __global float *fout0, __global float4 *fout14, __global float4 *fout58,
+        __global float4 *uvrho,
+        __global float *fin0, __global float4 *fin14, __global float4 *fin58,
+        __global uchar *obstacle,
+        float omega0, float cs_smag, int use_smag
+        )
+    {
+      const int ix = get_global_id(0);
+      const int iy = get_global_id(1);
+      const int ny = get_global_size(1);
+      const int idx = ix*ny + iy;
+
+      const float l0 = fin0[idx];
+      const float4 l14 = fin14[idx];
+      const float4 l58 = fin58[idx];
+
+      if (obstacle[idx] != 0) {
+          fout0[idx] = l0;
+          fout14[idx] = (float4) (l14.z, l14.w, l14.x, l14.y);
+          fout58[idx] = (float4) (l58.z, l58.w, l58.x, l58.y);
+          return;
+      }
+
+      const float f[9] = {l0, l14.x, l14.y, l14.z, l14.w, l58.x, l58.y, l58.z, l58.w};
+      const float w[9]  = {4.f/9.f, 1.f/9.f, 1.f/9.f, 1.f/9.f, 1.f/9.f, 1.f/36.f, 1.f/36.f, 1.f/36.f, 1.f/36.f};
+      const float cx[9] = {0.f, 1.f, 0.f, -1.f, 0.f, 1.f, -1.f, -1.f, 1.f};
+      const float cy[9] = {0.f, 0.f, 1.f, 0.f, -1.f, 1.f, 1.f, -1.f, -1.f};
+
+      float rho = 0.f, jx = 0.f, jy = 0.f;
+      for (int i = 0; i < 9; i++) { rho += f[i]; jx += cx[i]*f[i]; jy += cy[i]*f[i]; }
+      const float ux = jx/rho;
+      const float uy = jy/rho;
+      uvrho[idx] = (float4) (ux, uy, rho, 0.f);
+      const float usqr = 1.5f*(ux*ux + uy*uy);
+
+      // Non-equilibrium part and its second moments (stress tensor)
+      float feq[9], fneq[9];
+      float pxx = 0.f, pyy = 0.f, pxy = 0.f;
+      for (int i = 0; i < 9; i++) {
+          const float cu = 3.f*(cx[i]*ux + cy[i]*uy);
+          feq[i]  = w[i]*rho*(1.f + cu + 0.5f*cu*cu - usqr);
+          fneq[i] = f[i] - feq[i];
+          pxx += cx[i]*cx[i]*fneq[i];
+          pyy += cy[i]*cy[i]*fneq[i];
+          pxy += cx[i]*cy[i]*fneq[i];
+      }
+
+      float omega = omega0;
+      if (use_smag != 0) {
+          const float tau0 = 1.f/omega0;
+          const float strain = sqrt(pxx*pxx + pyy*pyy + 2.f*pxy*pxy);
+          omega = 2.f/(tau0 + sqrt(tau0*tau0 + 18.f*1.41421356f*cs_smag*cs_smag*strain/rho));
+      }
+
+      float o[9];
+      for (int i = 0; i < 9; i++) {
+          const float q = 4.5f*w[i]*((cx[i]*cx[i] - 1.f/3.f)*pxx + (cy[i]*cy[i] - 1.f/3.f)*pyy + 2.f*cx[i]*cy[i]*pxy);
+          o[i] = feq[i] + (1.f - omega)*q;
+      }
+      fout0[idx]  = o[0];
+      fout14[idx] = (float4) (o[1], o[2], o[3], o[4]);
+      fout58[idx] = (float4) (o[5], o[6], o[7], o[8]);
+    }
+
 // BGK collision (single relaxation time omega). Alternative to `moments`, not used by the time loop.
 __kernel void 
     fout(
@@ -386,6 +456,51 @@ __kernel void
       cur_c_dot_u = (c[iq].x*local_uv.x + c[iq].y*local_uv.y)*3.;
       fin58[index_two_d].x = t[iq]*local_rho*(1.+cur_c_dot_u+0.5*cur_c_dot_u*cur_c_dot_u-usqr);
 	  
+    }
+
+// Inlet of Zou & He (column ix = 0), one work-item per row : same density as bcs_inlet, but populations 1, 5, 8 are
+// obtained by bounce-back of the non-equilibrium part, which gives the right momentum and shear stress.
+__kernel void
+    bcs_inlet_zouhe(
+        __global float *fin0, __global float4 *fin14, __global float4 *fin58,
+        __global float4 *uvrho,
+        __global float2 *vel_inlet
+        )
+    {
+      const int iy = get_global_id(0);
+      const float2 uv = vel_inlet[iy];
+      const float4 l14 = fin14[iy];
+      const float4 l58 = fin58[iy];
+      const float rho = (fin0[iy] + l14.y + l14.w + 2.f*(l14.z + l58.z + l58.y))/(1.f - uv.x);
+      uvrho[iy] = (float4) (uv.x, uv.y, rho, 0.f);
+      fin14[iy].x = l14.z + 2.f/3.f*rho*uv.x;
+      fin58[iy].x = l58.z - 0.5f*(l14.y - l14.w) + rho*uv.x/6.f + 0.5f*rho*uv.y;
+      fin58[iy].w = l58.y + 0.5f*(l14.y - l14.w) + rho*uv.x/6.f - 0.5f*rho*uv.y;
+    }
+
+// Convective outlet (last column), one work-item per row, to run after bcs_sym : the incoming populations 3, 6, 7 are
+// advected at speed uc : f(outlet, t+1) = (f(outlet, t) + uc f(outlet-1, t+1)) / (1 + uc). `prev` (3 rows of ny floats)
+// keeps f(outlet, t) from one step to the next.
+__kernel void
+    bcs_outlet_convective(
+        __global float4 *fin14, __global float4 *fin58,
+        __global float *prev,
+        int nx, float uc
+        )
+    {
+      const int iy = get_global_id(0);
+      const int ny = get_global_size(0);
+      const int last = (nx-1)*ny + iy;
+      const int before = (nx-2)*ny + iy;
+      const float n3 = (prev[iy]        + uc*fin14[before].z)/(1.f + uc);
+      const float n6 = (prev[ny + iy]   + uc*fin58[before].y)/(1.f + uc);
+      const float n7 = (prev[2*ny + iy] + uc*fin58[before].z)/(1.f + uc);
+      fin14[last].z = n3;
+      fin58[last].y = n6;
+      fin58[last].z = n7;
+      prev[iy] = n3;
+      prev[ny + iy] = n6;
+      prev[2*ny + iy] = n7;
     }
 
 // Colors of the velocity norm written into a plain float4 buffer (blue -> red color map).
