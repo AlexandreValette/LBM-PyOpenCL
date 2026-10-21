@@ -1,32 +1,34 @@
 # LBM-PyOpenCL
 
-Lattice Boltzmann Method with Multiple Relaxation Time (LBM-MRT), D2Q9.
+Lattice Boltzmann Method with Multiple Relaxation Time (LBM-MRT), D2Q9, in 2D.
 
-Run on OpenCL compatible GPU.
-Tested on NVIDIA GTX970.
+The same model is implemented three times, and driven from a web page:
+  - **OpenCL** (`lbm_opencl.py` + `kernels.cl`) : on a GPU, or on the CPU with an OpenCL runtime ;
+  - **Python / NumPy** (`lbm_native.py`) : readable reference implementation ;
+  - **Python / Numba** (`lbm_numba.py`) : the same, compiled and multithreaded.
+Tests check that the three give the same fields (`tests/`).
 
-Code : 
-  - Host : PYTHON 
-  - Computation : OPENCL on GPU (or CPU)
-  - Graphics : OPENGL (with OpenCL interop)
- 
 # How to run it ?
-You can use the notebook Run.ipynb or the script Run.py.
+```
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python app.py        # opens http://localhost:8000
+```
+The page lets you choose the solver (and the GPU / CPU device), the grid, the Reynolds number, the obstacle and
+the display. It shows the FPS and where the solver runs (GPU, or CPU on N threads).
 
 # How to change the obstacle shape ?
-The obstacle shape is read from a text file. See Circle.txt for example.
+Obstacle shapes are text files (one `x;y` point per line, closed contour) in `world_objects/`.
+Drop a new file there and pick it in the page.
 
-# Third party libraries
-You need :
-  - numpy ;
-  - matplotlib ;
-  - pyopencl (and opencl) ;
-  - pyopengl ;
-  - sys ;
-  - time ;
-  
-For installing pyopencl, see :
-https://www.ibm.com/developerworks/community/blogs/jfp/entry/Installing_PyOpenCl_On_Anaconda_For_Windows?lang=en
+# Documentation
+See [DOCUMENTATION.md](DOCUMENTATION.md) : overview, reading guide of the code, LBM primer, file by file,
+client/server protocol, tests, performance.
+
+# Tests
+```
+.venv\Scripts\python -m unittest discover -s tests -v
+```
 
 # Some videos
 [![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/Ph7dVfcWveQ/0.jpg)](https://www.youtube.com/watch?v=Ph7dVfcWveQ)

@@ -1,10 +1,23 @@
+// OpenCL kernels of the lattice Boltzmann solver (D2Q9, MRT). Launched from lbm_opencl.py.
+//
+// Conventions used by every kernel
+//  - One work-item per grid cell (ix, iy) = (get_global_id(0), get_global_id(1)) ; flat index = ix * ny + iy.
+//  - Populations f_0..f_8 are split in f0 (float), f14 (float4 : f_1..f_4 in .x .y .z .w) and
+//    f58 (float4 : f_5..f_8). Directions : 0 rest, 1 +x, 2 +y, 3 -x, 4 -y, 5 (+1,+1), 6 (-1,+1), 7 (-1,-1), 8 (+1,-1).
+//  - uvrho is a float4 per cell : (u, v, rho, unused).
+//  - `fin` = after streaming, `fout` = after collision.
+//  - Time step : bcs_sym, bcs_inlet, moments (collision), streaming, then the optional dye / drawing kernels.
+//  - Pointers carry no access qualifier : the OpenCL 2.0 / 3.0 compilers reject __read_only etc. on __global pointers.
+
+// MRT collision. Reads fin ; computes rho, u, v (stored in uvrho) and the 9 moments ; relaxes the moments
+// towards equilibrium with M1S = M^-1 S ; writes fout. On obstacle cells : bounce-back (opposite directions swapped).
 __kernel void 
     moments(
-        __global __write_only float *fout0, __global __write_only float4 *fout14, __global __write_only float4 *fout58,
-        __global __write_only float4 *uvrho,
-        __global __read_only float *fin0, __global __read_only float4 *fin14, __global __read_only float4 *fin58,
-        __global __read_only float *M1S  , __local float *l_M1S,
-        __global __read_only uchar *obstacle
+        __global float *fout0, __global float4 *fout14, __global float4 *fout58,
+        __global float4 *uvrho,
+        __global float *fin0, __global float4 *fin14, __global float4 *fin58,
+        __global float *M1S  , __local float *l_M1S,
+        __global uchar *obstacle
         )
     {
       // Managing indexes
@@ -83,14 +96,15 @@ __kernel void
       }
     }
     
+// BGK collision (single relaxation time omega). Alternative to `moments`, not used by the time loop.
 __kernel void 
     fout(
-        __global __write_only float *fout0, __global __write_only float4 *fout14, __global __write_only float4 *fout58,
-        __global __read_only float *fin0, __global __read_only float4 *fin14, __global __read_only float4 *fin58,
-        __global __read_only float *feq0, __global __read_only float4 *feq14, __global __read_only float4 *feq58,
-        __global __read_only uchar *obstacle,
-        __global __read_only char *noslip,
-        __global __read_only float *omega
+        __global float *fout0, __global float4 *fout14, __global float4 *fout58,
+        __global float *fin0, __global float4 *fin14, __global float4 *fin58,
+        __global float *feq0, __global float4 *feq14, __global float4 *feq58,
+        __global uchar *obstacle,
+        __global char *noslip,
+        __global float *omega
         )
     {
       // Managing indexes
@@ -118,11 +132,13 @@ __kernel void
 
 
 
+// Streaming : fin(x, y)[i] = fout(x - c_i)[i]. Populations that would come from outside the domain are set to 0
+// (they are filled afterwards by bcs_sym / bcs_inlet).
 __kernel void 
     streaming(
-        __global __read_only float *fout0, __global __read_only float4 *fout14, __global __read_only float4 *fout58,
-        __global __write_only float *fin0, __global __write_only float4 *fin14, __global __write_only float4 *fin58,
-        __global __read_only char2 *c,
+        __global float *fout0, __global float4 *fout14, __global float4 *fout58,
+        __global float *fin0, __global float4 *fin14, __global float4 *fin58,
+        __global char2 *c,
         __local char2 *local_c
         )
     {
@@ -188,13 +204,14 @@ __kernel void
     } 
 
 
+// Equilibrium populations from (u, v, rho). Only used by the BGK collision.
 __kernel void 
     equilibrium(
-         __global __write_only float *feq0, __global __write_only float4 *feq14, __global __write_only float4 *feq58,
-        __global __read_only float4 *uvrho,
+         __global float *feq0, __global float4 *feq14, __global float4 *feq58,
+        __global float4 *uvrho,
         __local char2 *local_c, __local float *local_t,
-        __global __read_only char2 *c,
-        __global __read_only float *t
+        __global char2 *c,
+        __global float *t
         )
     {
 
@@ -243,11 +260,12 @@ __kernel void
    
 
 
+// rho and u, v from fin. Not used by the time loop (`moments` computes them).
 __kernel void 
     rho_uv(
-        __global __write_only float4 *uvrho,
-         __global __read_only float *fin0, __global __read_only float4 *fin14, __global __read_only float4 *fin58,
-        __global __read_only char2 *c
+        __global float4 *uvrho,
+         __global float *fin0, __global float4 *fin14, __global float4 *fin58,
+        __global char2 *c
         )
     {
  
@@ -279,9 +297,11 @@ __kernel void
 
 
 
+// Boundaries : top and bottom walls take the populations coming from the opposite side (periodic),
+// the outlet (last column) copies the previous column (zero gradient).
 __kernel void 
     bcs_sym(
-        __global __read_write float *fin0, __global __read_write float4 *fin14, __global __read_write float4 *fin58
+        __global float *fin0, __global float4 *fin14, __global float4 *fin58
         )
     {
 	
@@ -323,13 +343,15 @@ __kernel void
     }
 
 
+// Inlet (column ix = 0), one work-item per row : velocity imposed, density deduced from the known populations,
+// the unknown populations 1, 5, 8 are set to their equilibrium.
 __kernel void 
     bcs_inlet(
-        __global __read_write float *fin0, __global __read_write float4 *fin14, __global __read_write float4 *fin58,
-        __global __read_write float4 *uvrho,
-        __global __read_only char2 *c,
-        __global __read_only float *t,
-        __global __read_only float2 *vel_inlet,
+        __global float *fin0, __global float4 *fin14, __global float4 *fin58,
+        __global float4 *uvrho,
+        __global char2 *c,
+        __global float *t,
+        __global float2 *vel_inlet,
         int size_qx        
         )
     {
@@ -366,14 +388,15 @@ __kernel void
 	  
     }
 
+// Colors of the velocity norm written into a plain float4 buffer (blue -> red color map).
 __kernel void 
     norm_u_to_buffer(
-        __global __write_only float4 *norm_uv,
-        __global __read_only float4 *uvrho,
-        __global __read_only float4 *colormap_r,
-        __global __read_only float4 *colormap_g,
-        __global __read_only float4 *colormap_b,
-        __global __read_only float2 *norm_minmax
+        __global float4 *norm_uv,
+        __global float4 *uvrho,
+        __global float4 *colormap_r,
+        __global float4 *colormap_g,
+        __global float4 *colormap_b,
+        __global float2 *norm_minmax
          )
     {      
       int2 pixelcoord = (int2) (get_global_id(0), get_global_id(1));      
@@ -399,7 +422,7 @@ __kernel void
       }
       
       // Other size interpolation
-      norm = (norm-norm_minmax[0].x)/norm_minmax[0].y;
+      norm = (norm-norm_minmax[0].x)/(norm_minmax[0].y-norm_minmax[0].x);
       
       if(norm<0.33) {
               const float norm1 = 3*norm;
@@ -427,15 +450,17 @@ __kernel void
     }
           
     
+// Colors of the velocity norm written into an image. Obstacles are green.
+// The scale is norm_minmax = (min, max) : norm <= min gives the first color, >= max the last one.
 __kernel void 
     norm_uv_to_texture(
         __write_only image2d_t texture_normuv,
-        __global __read_only float4 *uvrho,
-        __global __read_only float4 *colormap_r,
-        __global __read_only float4 *colormap_g,
-        __global __read_only float4 *colormap_b,
-        __global __read_only float2 *norm_minmax,
-        __global __read_only uchar *obstacle
+        __global float4 *uvrho,
+        __global float4 *colormap_r,
+        __global float4 *colormap_g,
+        __global float4 *colormap_b,
+        __global float2 *norm_minmax,
+        __global uchar *obstacle
          )
     {
  
@@ -467,7 +492,7 @@ __kernel void
       }
       
       // Other size interpolation
-      norm = (norm-norm_minmax[0].x)/norm_minmax[0].y;
+      norm = (norm-norm_minmax[0].x)/(norm_minmax[0].y-norm_minmax[0].x);
       
       if(norm<0.33) {
               const float norm1 = 3*norm;
@@ -497,10 +522,11 @@ __kernel void
       
     }
     
+// Curl of the velocity (dv/dx - du/dy by finite differences) into a float buffer.
 __kernel void 
     curl_to_buffer(
-    __global __write_only float *norm_uv,
-        __global __read_only float4 *uvrho
+    __global float *norm_uv,
+        __global float4 *uvrho
 
          )
     {
@@ -522,15 +548,16 @@ __kernel void
       
     }
     
+// Colors of the signed curl into an image : -max -> first color, 0 -> middle, +max -> last color.
 __kernel void 
     curl_to_texture(
         __write_only image2d_t texture_normuv,
-        __global __read_only float4 *uvrho,
-        __global __read_only float4 *colormap_r,
-        __global __read_only float4 *colormap_g,
-        __global __read_only float4 *colormap_b,
-        __global __read_only float2 *norm_minmax,
-        __global __read_only uchar *obstacle
+        __global float4 *uvrho,
+        __global float4 *colormap_r,
+        __global float4 *colormap_g,
+        __global float4 *colormap_b,
+        __global float2 *norm_minmax,
+        __global uchar *obstacle
          )
     {
  
@@ -543,40 +570,44 @@ __kernel void
       const float local_u = uvrho[two_d_index].x;
       const float local_v = uvrho[two_d_index].y;
       
-      const float local_u_y1 = uvrho[two_d_index+1].x;
-      const float local_v_x1 = uvrho[two_d_index+size_1].y;
-      
       if(obstacle[two_d_index]!=0){
           write_imagef(texture_normuv, pixelcoord, (float4) (0.,0.5,0.,1.));
           return;
       }
-      
-      // Compute norm
-      //float curl = local_v_x1*local_u-local_u_y1*local_v;
-      float curl =(local_v_x1-local_v)-(local_u_y1-local_u);
-      float4  val;
-      
-      // Manage min/max
-      if(curl<=norm_minmax[0].x) {
-              val = (float4) (colormap_r[0].x,colormap_g[0].x,colormap_b[0].x,1.);
-              write_imagef(texture_normuv, pixelcoord, val);
-              return;                
+
+      // Curl by finite differences (zero on the last row/column)
+      float curl = 0.f;
+      if(get_global_id(1)<size_1-1 && get_global_id(0)<size_0-1) {
+          const float local_u_y1 = uvrho[two_d_index+1].x;
+          const float local_v_x1 = uvrho[two_d_index+size_1].y;
+          curl = (local_v_x1-local_v)-(local_u_y1-local_u);
       }
-      if(curl>=norm_minmax[0].y) {
-              val = (float4) (colormap_r[0].w,colormap_g[0].w,colormap_b[0].w,1.);
-              write_imagef(texture_normuv, pixelcoord, val);
-              return;                
-      }      
-       
-      // Apply colormap to texture_normuv
-      if(get_global_id(1)<size_1-2 && get_global_id(0)<size_0-2)
-          write_imagef(texture_normuv, pixelcoord, (float4) (1.,1.,1.,1.));
-      
+
+      // Signed curl, symmetric around 0 : curl = -max -> first color, +max -> last color
+      float norm = clamp(0.5f + 0.5f*curl/norm_minmax[0].y, 0.f, 1.f);
+      float4 val;
+      if(norm<0.33f) {
+              const float n1 = 3*norm;
+              val = (float4) (colormap_r[0].x + n1*(colormap_r[0].y-colormap_r[0].x),
+                              colormap_g[0].x + n1*(colormap_g[0].y-colormap_g[0].x),
+                              colormap_b[0].x + n1*(colormap_b[0].y-colormap_b[0].x), 1.f);
+      }
+      else if (norm<0.66f) {
+              const float n2 = 3*norm-1;
+              val = (float4) (colormap_r[0].y + n2*(colormap_r[0].z-colormap_r[0].y),
+                              colormap_g[0].y + n2*(colormap_g[0].z-colormap_g[0].y),
+                              colormap_b[0].y + n2*(colormap_b[0].z-colormap_b[0].y), 1.f);
+      }
+      else {
+              const float n3 = 3*norm-2;
+              val = (float4) (colormap_r[0].z + n3*(colormap_r[0].w-colormap_r[0].z),
+                              colormap_g[0].z + n3*(colormap_g[0].w-colormap_g[0].z),
+                              colormap_b[0].z + n3*(colormap_b[0].w-colormap_b[0].z), 1.f);
+      }
+      write_imagef(texture_normuv, pixelcoord, val);
     }
-    
 
-    
-
+// Bilinear interpolation of a 2D vector / a scalar in a cell ; vec_diff = position inside the cell, in [0, 1[ x [0, 1[.
 float2 float2_bilinearinterpol(float2 vec_diff, float2 u00, float2 u01, float2 u10, float2 u11) {                
                 
         float2 u0i = u00+vec_diff.y*(u01-u00); 
@@ -592,6 +623,7 @@ float scalar_bilinearinterpol(float2 vec_diff, float u00, float u01, float u10, 
 }
 
  
+// Cubic Lagrange interpolation on a 4 x 4 stencil (um1m1 = u(-1,-1) ... u22 = u(2,2)) at position s inside the central cell.
 float scalar_polyinterpol(float2 s,     float um1m1, float um10, float um11 , float um12,
                                         float u0m1 , float u00 , float u01  , float u02,
                                         float u1m1 , float u10 , float u11  , float u12,
@@ -615,11 +647,13 @@ float2 grid_percent_vec(float2 vec, int2 x1int) {
 }
       
     
+// Dye advection, semi-Lagrangian : follow the velocity backwards (3-stage Runge-Kutta) and interpolate the dye
+// there with a bicubic (4 x 4 Lagrange) interpolation. Two copies of the dye (.x, .y) are read / written alternately.
 __kernel void 
     dye_bipolyinter(
-        __global __read_write float2 *dye,   
-        __global __read_only float4 *uvrho,
-        __global __read_only uchar *obstacle,
+        __global float2 *dye,   
+        __global float4 *uvrho,
+        __global uchar *obstacle,
         uchar read_channel
          )
     { 
@@ -709,10 +743,11 @@ __kernel void
        if(read_channel==0) dye[two_d_index].y = qn;
        else dye[two_d_index].x = qn;    
     }
+// Writes the dye value of every active emitter into the dye field and decrements its remaining life.
 __kernel void 
     update_dye_emitter(
-        __global __read_write float4 *dye_emitter,   
-        __global __write_only float2 *dye
+        __global float4 *dye_emitter,   
+        __global float2 *dye
          )
     { 
        
@@ -726,114 +761,33 @@ __kernel void
    
     }
          
-__kernel void 
-    dye_bilinearinter(
-        __global __read_write float2 *dye,   
-        __read_write image2d_t texture,
-        __global __read_only float4 *uvrho,
-        uchar read_channel
-         )
-    { 
-      int2 pixelcoord = (int2) (get_global_id(0), get_global_id(1));  
-      float2 fpixelcoord = (float2) ((float) pixelcoord.x, (float) pixelcoord.y);
-      
-      const int ix = get_global_id(0);
-      const int iy = get_global_id(1);
-             
-      const int size_0 = get_global_size(0);
-      const int size_1 = get_global_size(1);
-      
-      const int two_d_index = ix*size_1 + iy;
-      
-      float qn = 0.;      
-             
-      float2 k1 = (float2)(-uvrho[two_d_index].x,-uvrho[two_d_index].y);
-      float2 xtemp = fpixelcoord + 0.5f*k1;      
-
-      if(xtemp.x>=0 && xtemp.x<size_0-1 && xtemp.y>=0 && xtemp.y<size_1-1 ) {      
-   
-          int2 xint = (int2) ((int) xtemp.x, (int) xtemp.y);
-          int index00 = size_1*xint.x+xint.y;
-          int index10 = size_1*(xint+1).x+xint.y;
-          int index01 = index00+1;
-          int index11 = index10+1;      
-          float2 u00 = (float2) (uvrho[index00].x, uvrho[index00].y);
-          float2 u01 = (float2) (uvrho[index01].x, uvrho[index01].y);
-          float2 u10 = (float2) (uvrho[index10].x, uvrho[index10].y);
-          float2 u11 = (float2) (uvrho[index11].x, uvrho[index11].y);      
-        
-          float2 k2 = - float2_bilinearinterpol(grid_percent_vec(xtemp, xint), u00, u01,u10, u11);
-          xtemp = fpixelcoord + 0.75f*k2;
-           
-          if(xtemp.x>=0 && xtemp.x<size_0-1 && xtemp.y>=0 && xtemp.y<size_1-1 ) {    
-              xint = (int2) ((int) xtemp.x, (int) xtemp.y);
-              index00 = size_1*xint.x+xint.y;
-              index10 = size_1*(xint+1).x+xint.y;
-              index01 = index00+1;
-              index11 = index10+1;      
-              u00 = (float2) (uvrho[index00].x, uvrho[index00].y);
-              u01 = (float2) (uvrho[index01].x, uvrho[index01].y);
-              u10 = (float2) (uvrho[index10].x, uvrho[index10].y);
-              u11 = (float2) (uvrho[index11].x, uvrho[index11].y);    
-              float2 k3 = - float2_bilinearinterpol(grid_percent_vec(xtemp, xint), u00, u01,u10, u11);
-              xtemp = fpixelcoord + 0.22222222222222222222f*k1 +0.33333333333333333333f *k2 + 0.44444444444444444444f*k3;
-        
-              if(xtemp.x>=0 && xtemp.x<size_0-1 && xtemp.y>=0 && xtemp.y<size_1-1 ) {    
-                 
-                  xint = (int2) ((int) xtemp.x, (int) xtemp.y);
-                  index00 = size_1*xint.x+xint.y;
-                  index10 = size_1*(xint+1).x+xint.y;
-                  index01 = index00+1;
-                  index11 = index10+1;     
-                  
-                  // Finally interpole the dye at point xtemp
-                  if(read_channel==1)
-                          qn =  scalar_bilinearinterpol(grid_percent_vec(xtemp, xint), dye[index00].y, dye[index01].y,dye[index10].y, dye[index11].y);
-                  else qn =  scalar_bilinearinterpol(grid_percent_vec(xtemp, xint), dye[index00].x, dye[index01].x,dye[index10].x, dye[index11].x);
-              
-              }
-          }
-      } 
-      
-      float4 res = read_imagef(texture, pixelcoord);
-       // Update the dye and the texture             
-       if(read_channel==0) {                   
-               dye[two_d_index].y = qn;
-               res.w = 1-qn;                       
-                       }
-       else {                
-               dye[two_d_index].x = qn;
-               res.w = 1-qn;                
-               }  
-       write_imagef(texture, pixelcoord, res);    
-    }
-    
+// Dye -> alpha channel of the texture. Two distinct images (read_only / write_only) :
+// __read_write images are an optional OpenCL 2.0 feature that many devices (Intel CPU runtime) lack.
 __kernel void 
     dye_to_texture(
-        __global __read_write float2 *dye,   
-        __read_write image2d_t texture,
+        __global float2 *dye,   
+        __read_only image2d_t texture_in,
+        __write_only image2d_t texture_out,
         uchar read_channel
          )
     { 
-      
-      // Managing indexes
       const int ix = get_global_id(0);
       const int iy = get_global_id(1);
       const int2 pixelcoord = (int2) (ix,iy);
-      const int size_1 = get_global_size(1);  
-      const int two_d_index = ix*size_1 + iy;
+      const int two_d_index = ix*get_global_size(1) + iy;
       
-      float qn;
-      if(read_channel==0)
-    		qn = dye[two_d_index].x;                
-	   else qn = dye[two_d_index].y; 
-      
-      float4 res = read_imagef(texture, pixelcoord);
-       // Update the dye and the texture             
-       if(read_channel==0)                   
-                res.w = 1-qn;                       
-                    
-       else res.w = 1-qn;                
-            
-       write_imagef(texture, pixelcoord, res);    
+      const float qn = (read_channel==0) ? dye[two_d_index].x : dye[two_d_index].y; 
+      float4 res = read_imagef(texture_in, pixelcoord);
+      res.w = 1-qn;
+      write_imagef(texture_out, pixelcoord, res);    
+    }
+
+__kernel void 
+    copy_texture(
+        __read_only image2d_t texture_in,
+        __write_only image2d_t texture_out
+         )
+    {
+      const int2 pixelcoord = (int2) (get_global_id(0), get_global_id(1));
+      write_imagef(texture_out, pixelcoord, read_imagef(texture_in, pixelcoord));
     }

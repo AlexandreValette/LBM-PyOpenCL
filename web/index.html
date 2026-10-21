@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LBM Solver</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #1d2330; --muted: #667085; --border: #d8dce5;
+    --accent: #2f6fed; --accent-text: #ffffff; --danger: #c0392b; --view-bg: #0b0d12;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151c; --panel: #1b1f2a; --text: #e6e9f0; --muted: #98a1b3; --border: #2d3343;
+      --accent: #5b8cff; --accent-text: #0b0d12; --danger: #ff7b6b; --view-bg: #000;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12151c; --panel: #1b1f2a; --text: #e6e9f0; --muted: #98a1b3; --border: #2d3343;
+    --accent: #5b8cff; --accent-text: #0b0d12; --danger: #ff7b6b; --view-bg: #000;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  main { max-width: 1280px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .config { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px 24px; }
+  fieldset { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  legend { font-weight: 600; padding: 0; margin-bottom: 6px; }
+  .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+  label { display: grid; grid-template-columns: 110px 1fr 56px; align-items: center; gap: 8px; }
+  label.check { grid-template-columns: auto 1fr; }
+  label span.val { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  input, select { width: 100%; min-width: 0; padding: 4px 6px; font: inherit; color: var(--text);
+                  background: var(--bg); border: 1px solid var(--border); border-radius: 4px; }
+  input[type=range] { padding: 0; accent-color: var(--accent); }
+  input[type=checkbox] { width: auto; }
+  label.off { opacity: .4; }
+  input:disabled, select:disabled { cursor: not-allowed; }
+  .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; padding: 6px 16px; border-radius: 6px; border: 1px solid var(--border);
+           background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  .status { display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: baseline; }
+  .status b { font-variant-numeric: tabular-nums; }
+  .status .k { color: var(--muted); margin-right: 4px; }
+  #state.error, #error { color: var(--danger); }
+  #view { position: relative; overflow: hidden; background: var(--view-bg); border-radius: 8px;
+          border: 1px solid var(--border); width: 100%; cursor: grab; touch-action: none; }
+  #view.dragging { cursor: grabbing; }
+  #screen { position: absolute; left: 0; top: 0; transform-origin: 0 0; width: 100%; height: 100%; display: block; }
+  .view-hint { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>LBM — Lattice Boltzmann (D2Q9, MRT)</h1>
+
+  <section class="panel">
+    <form class="config" id="config" onsubmit="return false">
+      <fieldset>
+        <legend>Simulation <span class="hint">(appliqué au démarrage)</span></legend>
+        <label>Solveur <select id="solver"><option value="opencl">OpenCL (GPU / CPU)</option><option value="native">Python natif (NumPy)</option><option value="numba">Python natif (Numba)</option></select><span></span></label>
+        <label>Device OpenCL <select id="device"></select><span></span></label>
+        <label>Threads CPU <input id="threads" type="number" min="0" max="256" step="1" value="0"><span class="hint">0 = tous</span></label>
+        <label>Grille nx <input id="nx" type="number" min="64" max="4096" step="32" value="512"><span></span></label>
+        <label>Grille ny <input id="ny" type="number" min="64" max="2048" step="32" value="256"><span></span></label>
+        <label>Speedup <input id="speedup" type="number" min="0.1" max="3" step="0.1" value="1"><span></span></label>
+        <label class="check"><input id="dye" type="checkbox" checked> Colorant (émetteur à l'entrée)</label>
+        <label>Colorant y <input id="dye_y" type="range" min="0.05" max="0.95" step="0.01" value="0.5"><span class="val"></span></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Écoulement <span class="hint">(en direct)</span></legend>
+        <label>Reynolds <input id="re_log" type="range" min="2" max="7" step="0.05" value="4"><span class="val" id="re_val"></span></label>
+        <label>Pas / image <input id="iter_per_frame" type="range" min="1" max="50" step="1" value="10"><span class="val"></span></label>
+        <label>Affichage <select id="display"><option value="norm">Norme de la vitesse</option><option value="curl">Rotationnel</option></select><span></span></label>
+        <label>Échelle vitesse <input id="t_max" type="range" min="0.01" max="0.2" step="0.005" value="0.08"><span class="val"></span></label>
+        <label>Échelle rotat. <input id="curl_max" type="range" min="0.005" max="0.1" step="0.005" value="0.03"><span class="val"></span></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Obstacle <span class="hint">(en direct)</span></legend>
+        <label>Profil <select id="obstacle_file"></select><span></span></label>
+        <label>Position x <input id="obstacle_x" type="range" min="0.05" max="0.95" step="0.005" value="0.25"><span class="val"></span></label>
+        <label>Position y <input id="obstacle_y" type="range" min="0.05" max="0.95" step="0.005" value="0.5"><span class="val"></span></label>
+        <label>Rotation <input id="obstacle_rotation" type="range" min="-180" max="180" step="1" value="45"><span class="val"></span></label>
+        <label>Taille <input id="obstacle_scale" type="range" min="0.02" max="0.6" step="0.005" value="0.14"><span class="val"></span></label>
+      </fieldset>
+    </form>
+    <div class="actions" style="margin-top:12px">
+      <button class="primary" id="start">Démarrer</button>
+      <button id="stop">Arrêter</button>
+      <span id="error"></span>
+    </div>
+  </section>
+
+  <section class="panel status">
+    <span><span class="k">État</span><b id="state">déconnecté</b></span>
+    <span><span class="k">FPS</span><b id="fps">–</b></span>
+    <span><span class="k">MLUPS</span><b id="mlups">–</b></span>
+    <span><span class="k">Solveur</span><b id="devtext">–</b></span>
+    <span><span class="k">Grille</span><b id="grid">–</b></span>
+    <span><span class="k">Itération</span><b id="iteration">–</b></span>
+  </section>
+
+  <div id="view"><canvas id="screen" width="512" height="256"></canvas></div>
+  <div class="view-hint">Molette : zoom · glisser : déplacer · double-clic : recentrer</div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const LIVE = ["re", "iter_per_frame", "display", "t_max", "curl_max",
+              "obstacle_file", "obstacle_x", "obstacle_y", "obstacle_rotation", "obstacle_scale"];
+let ws = null, running = false, defaults = null;
+
+// ---------- form <-> config
+function readConfig() {
+  return {
+    solver: $("solver").value, threads: +$("threads").value, device: +$("device").value, nx: +$("nx").value, ny: +$("ny").value, speedup: +$("speedup").value,
+    dye: $("dye").checked, dye_y: +$("dye_y").value,
+    re: Math.pow(10, +$("re_log").value), iter_per_frame: +$("iter_per_frame").value,
+    display: $("display").value, t_max: +$("t_max").value, curl_max: +$("curl_max").value,
+    obstacle_file: $("obstacle_file").value, obstacle_x: +$("obstacle_x").value, obstacle_y: +$("obstacle_y").value,
+    obstacle_rotation: +$("obstacle_rotation").value, obstacle_scale: +$("obstacle_scale").value,
+  };
+}
+function showValues() {
+  document.querySelectorAll("input[type=range]").forEach(r => {
+    const v = r.parentElement.querySelector(".val");
+    if (v && r.id !== "re_log") v.textContent = r.value;
+  });
+  $("re_val").textContent = Math.pow(10, +$("re_log").value).toExponential(1);
+}
+function sendLive(id) {
+  showValues();
+  if (!running || !ws || ws.readyState !== 1) return;
+  const cfg = readConfig(), params = {};
+  LIVE.forEach(k => params[k] = cfg[k]);
+  clearTimeout(sendLive.t);
+  sendLive.t = setTimeout(() => ws.send(JSON.stringify({type: "set", params})), 40);
+}
+// The Python solvers run on the CPU, without dye : grey out the OpenCL-only options (threads : Numba only)
+function onSolverChange() {
+  const solver = $("solver").value, native = solver !== "opencl";
+  const off = {device: native, dye: native, dye_y: native, threads: solver !== "numba"};
+  Object.keys(off).forEach(id => {
+    $(id).disabled = off[id];
+    $(id).closest("label").classList.toggle("off", off[id]);
+  });
+}
+$("solver").addEventListener("change", onSolverChange);
+document.querySelectorAll("#config input, #config select").forEach(el => {
+  el.addEventListener("input", () => sendLive(el.id));
+});
+
+// ---------- websocket
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.binaryType = "blob";
+  ws.onopen = () => { $("state").textContent = running ? "en cours" : "prêt"; };
+  ws.onclose = () => { $("state").textContent = "déconnecté"; running = false; setTimeout(connect, 2000); };
+  ws.onmessage = async ev => {
+    if (typeof ev.data === "string") return onStats(JSON.parse(ev.data));
+    const bmp = await createImageBitmap(ev.data);
+    const cv = $("screen");
+    if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; fitView(); }
+    cv.getContext("2d").drawImage(bmp, 0, 0);
+    bmp.close();
+    ws.send('{"type":"ack"}');
+  };
+}
+function onStats(s) {
+  const labels = {starting: "démarrage", running: "en cours", stopped: "arrêté", error: "erreur"};
+  $("state").textContent = labels[s.state] || s.state;
+  $("state").className = s.state === "error" ? "error" : "";
+  $("fps").textContent = s.fps.toFixed(1);
+  $("mlups").textContent = s.mlups.toFixed(1);
+  $("devtext").textContent = s.device || "–";
+  $("grid").textContent = s.grid.join(" × ");
+  $("iteration").textContent = s.iteration.toLocaleString("fr-FR");
+  $("error").textContent = s.error || "";
+  running = s.state === "running" || s.state === "starting";
+}
+$("start").onclick = () => {
+  if (!ws || ws.readyState !== 1) return;
+  $("error").textContent = "";
+  running = true;
+  ws.send(JSON.stringify({type: "start", config: readConfig()}));
+};
+$("stop").onclick = () => { if (ws && ws.readyState === 1) { running = false; ws.send('{"type":"stop"}'); } };
+
+// ---------- view : zoom / pan
+const view = $("view"), screen = $("screen");
+let zoom = 1, panX = 0, panY = 0;
+function fitView() {
+  view.style.height = Math.round(view.clientWidth * screen.height / screen.width) + "px";
+  applyView();
+}
+function applyView() { screen.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`; }
+view.addEventListener("wheel", e => {
+  e.preventDefault();
+  const r = view.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const f = e.deltaY < 0 ? 1.25 : 0.8, nz = Math.min(Math.max(zoom * f, 1), 20);
+  panX = mx - (mx - panX) * nz / zoom; panY = my - (my - panY) * nz / zoom; zoom = nz;
+  if (zoom === 1) { panX = panY = 0; }
+  applyView();
+}, {passive: false});
+let drag = null;
+view.addEventListener("pointerdown", e => { drag = {x: e.clientX - panX, y: e.clientY - panY}; view.setPointerCapture(e.pointerId); view.classList.add("dragging"); });
+view.addEventListener("pointermove", e => { if (drag) { panX = e.clientX - drag.x; panY = e.clientY - drag.y; applyView(); } });
+view.addEventListener("pointerup", () => { drag = null; view.classList.remove("dragging"); });
+view.addEventListener("dblclick", () => { zoom = 1; panX = panY = 0; applyView(); });
+window.addEventListener("resize", fitView);
+
+// ---------- init
+async function init() {
+  const [devices, conf] = await Promise.all([fetch("/api/devices").then(r => r.json()), fetch("/api/config").then(r => r.json())]);
+  defaults = conf.defaults;
+  $("device").innerHTML = devices.map(d =>
+    `<option value="${d.id}">${d.type} · ${d.name} (${d.compute_units} CU)</option>`).join("");
+  $("obstacle_file").innerHTML = '<option value="">(aucun)</option>' +
+    conf.obstacles.map(f => `<option>${f}</option>`).join("");
+  const d = defaults;
+  $("solver").value = d.solver; $("threads").value = d.threads; $("device").value = d.device; $("nx").value = d.nx; $("ny").value = d.ny; $("speedup").value = d.speedup;
+  $("dye").checked = d.dye; $("dye_y").value = d.dye_y; $("re_log").value = Math.log10(d.re);
+  $("iter_per_frame").value = d.iter_per_frame; $("display").value = d.display;
+  $("t_max").value = d.t_max; $("curl_max").value = d.curl_max;
+  $("obstacle_file").value = d.obstacle_file; $("obstacle_x").value = d.obstacle_x; $("obstacle_y").value = d.obstacle_y;
+  $("obstacle_rotation").value = d.obstacle_rotation; $("obstacle_scale").value = d.obstacle_scale;
+  onSolverChange(); showValues(); fitView(); connect();
+}
+init();
+</script>
+</body>
+</html>

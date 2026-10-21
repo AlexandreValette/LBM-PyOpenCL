@@ -1,0 +1,9 @@
+numpy
+matplotlib
+pyopencl
+fastapi
+uvicorn[standard]
+pillow
+numba
+# Optional : OpenCL runtime for the CPU (Windows/Linux, also works on AMD CPUs)
+intel-opencl-rt
